@@ -1,0 +1,4 @@
+ch.qos.logback.classic.LoggerContext: jar:nested:/app.jar/!BOOT-INF/lib/logback-classic-1.5.22.jar!/
+ch.qos.logback.core.ContextBase: jar:nested:/app.jar/!BOOT-INF/lib/logback-core-1.5.30.jar!/
+Action:
+Correct the classpath of your application so that it contains a single, compatible version of ch.qos.logback.classic.LoggerContext
