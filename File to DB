@@ -1,0 +1,98 @@
+curl --location 'http://localhost:9000/jobs' \
+--header 'X-Correlation-ID: py-api-to-db-test002' \
+--header 'Content-Type: application/json' \
+--header 'Authorization: Basic YWRtaW46YWRtaW4xMjM=' \
+--data '{
+  "job_type": "file-to-db",
+  "job_id": "test-file-to-db",
+  "payload": {
+    "file": {
+      "file_type": "json",
+      "file_path": "C:\\\\PycharmProjects\\genesis\\jpmc_sep2025.json",
+      "delimiter": ",",
+      "quotechar": "\"",
+      "has_header": true,
+      "encoding": "utf-8"
+ 
+    },
+ 
+    "db": {
+      "sqlalchemy_url": "",
+      "schema_name": "",
+      "table_name": "invoice_fee"
+    },
+ 
+    "source_avro_schema": {
+      "type": "record",
+      "name": "edi_source",
+      "fields": [
+        { "name": "partner_bank_name", "type": ["null", "string"]},
+        { "name": "invoice_dt", "type": ["null", "string"]},
+        { "name": "from_dt", "type": ["null", "string"] },
+        { "name": "to_dt", "type": ["null", "string"] },
+        { "name": "account_id", "type": ["null", "string"] },
+        { "name": "account_description", "type": ["null", "string"] },
+        { "name": "currency", "type": ["null", "string"]},
+        { "name": "parent_account_id", "type": ["null", "string"]},
+        { "name": "service_code", "type": ["null", "string"] },
+        { "name": "service_description", "type": ["null", "string"] },
+        { "name": "charge_amount", "type": ["null", "string"] },
+        { "name": "volume", "type": ["null", "string"] },
+        { "name": "unit_price", "type": ["null", "string"]},
+        { "name": "balance", "type": ["null", "string"]},
+        { "name": "service_type", "type": ["null", "string"] },
+        { "name": "tax_designation", "type": ["null", "string"] },
+        { "name": "source_file_type", "type": ["null", "string"] }
+
+      ]
+    },
+ 
+    "target_avro_schema": {
+      "type": "record",
+      "name": "edi_target",
+      "fields": [
+        { "name": "partner_bank_name", "type": ["null", "string"]},
+        { "name": "invoice_dt", "type": ["null", "string"]},
+        { "name": "from_dt", "type": ["null", "string"] },
+        { "name": "to_dt", "type": ["null", "string"] },
+        { "name": "account_id", "type": ["null", "string"] },
+        { "name": "account_description", "type": ["null", "string"] },
+        { "name": "currency", "type": ["null", "string"]},
+        { "name": "parent_account_id", "type": ["null", "string"]},
+        { "name": "service_code", "type": ["null", "string"] },
+        { "name": "service_description", "type": ["null", "string"] },
+        { "name": "charge_amount", "type": ["null", "string"] },
+        { "name": "volume", "type": ["null", "string"] },
+        { "name": "unit_price", "type": ["null", "string"]},
+        { "name": "balance", "type": ["null", "string"]},
+        { "name": "service_type", "type": ["null", "string"] },
+        { "name": "tax_designation", "type": ["null", "string"] },
+        { "name": "source_file_type", "type": ["null", "string"] }
+
+
+      ]
+    },
+ 
+    "mapping": [
+      { "source": "partner_bank_name", "target": "partner_bank_name" },
+      { "source": "invoice_dt", "target": "invoice_dt" },
+      { "source": "from_dt", "target": "from_dt" },
+      { "source": "to_dt", "target": "to_dt" },
+      { "source": "account_id", "target": "account_id" },
+      { "source": "account_description", "target": "account_description" },
+      { "source": "currency", "target": "currency"},
+      { "source": "parent_account_id", "target": "parent_account_id" },
+      { "source": "service_code", "target": "service_code" },
+      { "source": "service_description", "target": "service_description" },
+      { "source": "charge_amount", "target": "charge_amount" },
+      { "source": "volume", "target": "volume" },
+      { "source": "unit_price", "target": "unit_price"},
+      { "source": "balance", "target": "balance"},
+      { "source": "service_type", "target": "service_type" },
+      { "source": "tax_designation", "target": "tax_designation"},
+      { "source": "source_file_type", "target": "source_file_type"}
+
+
+    ]
+  }
+}'
