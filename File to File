@@ -1,0 +1,35 @@
+curl --location 'http://localhost:9000/jobs' \
+--header 'X-Correlation-ID: py-api-to-db-test002' \
+--header 'Content-Type: application/json' \
+--header 'Authorization: Basic YWRtaW46YWRtaW4xMjM=' \
+--data '{
+    "job_type": "file-to-file",
+    "job_id": "test-file-to-file",
+    "payload": {
+        "source": {
+            "type": "twist",
+            "path": "C:\\\\PycharmProjects\\genesis\\Barclays Bank PLC_BARCGB22_202410_07-30-25_082152_SXV84.xml",
+            "header": false,
+            "delimiter": ",",
+            "quotechar": "\"",
+            "has_header": true,
+            "newline": "\n",
+            "compress": false,
+            "null_literal": "",
+            "encoding": "utf-8",
+            "skip_lines": 0
+        },
+        "target": {
+            "type": "json",
+            "path": "C:\\\\PycharmProjects\\genesis\\Barclays_july2025.json",
+            "header": true,
+            "delimiter": "|",
+            "quotechar": "\"",
+            "has_header": false,
+            "newline": "\n",
+            "compress": false,
+            "null_literal": "",
+            "encoding": "utf-8"
+        }
+    }
+}'
