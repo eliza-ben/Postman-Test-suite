@@ -1,3 +1,8 @@
+Caused by: tools.jackson.databind.exc.MismatchedInputException: Cannot map `null` into type `boolean` (set DeserializationConfig.DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES to 'false' to allow)
+ at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); byte offset: #69] (through reference chain: org.fcb.genesis.fileintel.dto.request.FileOperationRequest["request"]->org.fcb.genesis.fileintel.dto.request.RequestMetadata["dryRun"])
+
+
+
 ch.qos.logback.classic.LoggerContext: jar:nested:/app.jar/!BOOT-INF/lib/logback-classic-1.5.22.jar!/
 ch.qos.logback.core.ContextBase: jar:nested:/app.jar/!BOOT-INF/lib/logback-core-1.5.30.jar!/
 Action:
