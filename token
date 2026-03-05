@@ -1,0 +1,125 @@
+"""Service token manager with automatic rotation."""
+
+import os
+import time
+from typing import Optional
+import httpx
+from fastapi import HTTPException
+
+from .creds import SecretsClient
+from .logging import get_correlation_id
+
+
+class ServiceTokenManager:
+    """Manages rotating service tokens with pre-expiry refresh."""
+    
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: Optional[str] = None,
+        audience: Optional[str] = None,
+        base_url: Optional[str] = None,
+        skew_seconds: int = 300,
+    ):
+        """
+        Initialize service token manager.
+        
+        Args:
+            client_id: Service client ID
+            client_secret: Client secret (if None, fetched from gateway using client_id as secret name)
+            audience: JWT audience (defaults to JWT_AUDIENCE env var)
+            base_url: Security gateway base URL (defaults to SECURITY_BASE_URL env var)
+            skew_seconds: Refresh token this many seconds before expiry
+        """
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.audience = audience or os.getenv("JWT_AUDIENCE", "etl-services")
+        self.base_url = base_url or os.getenv("SECURITY_BASE_URL", "http://security-gateway:8088")
+        self.skew_seconds = skew_seconds
+        
+        self._token: Optional[str] = None
+        self._expires_at: float = 0.0
+        self._secrets_client = SecretsClient(base_url=self.base_url)
+    
+    async def _fetch_client_secret(self) -> str:
+        """Fetch client secret from security gateway if not provided."""
+        if self.client_secret:
+            return self.client_secret
+        
+        # Use client_id as secret name
+        secret = await self._secrets_client.get_secret(self.client_id)
+        self.client_secret = secret
+        return secret
+    
+    async def _mint_token(self) -> tuple[str, int]:
+        """
+        Mint a new service token from security gateway.
+        
+        Returns:
+            Tuple of (access_token, expires_in)
+        """
+        client_secret = await self._fetch_client_secret()
+        
+        url = f"{self.base_url}/v1/tokens/service"
+        payload = {
+            "client_id": self.client_id,
+            "client_secret": client_secret,
+            "audience": self.audience,
+        }
+        
+        try:
+            # CRITICAL: Propagate correlation ID to downstream service
+            correlation_id = get_correlation_id()
+            headers = dict()
+            headers["X-Correlation-ID"] = correlation_id
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(url, json=payload, headers=headers)
+                
+                if response.status_code != 200:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Token minting failed ({response.status_code}): {response.text}",
+                    )
+                
+                data = response.json()
+                return data["access_token"], data["expires_in"]
+        
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Security gateway connection error: {str(e)}",
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to mint token: {str(e)}",
+            )
+    
+    async def get_token(self) -> str:
+        """
+        Get valid service token, refreshing if necessary.
+        
+        Returns:
+            Valid access token
+        """
+        now = time.time()
+        
+        # Check if token needs refresh (expired or within skew window)
+        if not self._token or now >= (self._expires_at - self.skew_seconds):
+            access_token, expires_in = await self._mint_token()
+            self._token = access_token
+            self._expires_at = now + expires_in
+        
+        return self._token
+    
+    async def get_auth_header(self) -> dict[str, str]:
+        """
+        Get Authorization header with valid token.
+        
+        Returns:
+            Dictionary with Authorization header
+        """
+        token = await self.get_token()
+        return {"Authorization": f"Bearer {token}"}
