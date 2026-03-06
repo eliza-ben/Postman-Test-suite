@@ -1,0 +1,54 @@
+variables:
+  CREATE_RELEAESE:
+    value: "No"
+    description: "Please enter the value to create release[tag] only for master branch ( Yes | No )"
+  DEPLOY_VARIABLE:
+    value: "development"
+    description: "Please enter Build/Deployment environment only for manual ( testing | staging | production )"
+  OSE_PROJECT_NAME:
+    value: "gen-hub-dev"
+    description: "Please enter the Openshift Project/Namespace only for manual ( gen-hub-dev | gen-hub-qa | gen-hub-uat | gen-hub-prod )"
+  DEPLOY_DEV_VARIABLE: "development"
+  DEPLOY_QA_VARIABLE: "testing"
+  python_version: "3.10"
+  NEXUS_PROJECT_REPO: "dso-npm"
+
+# ======================================================================================================================
+# CI/CD Templates
+# ======================================================================================================================
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Jobs/Code-Quality.gitlab-ci.yml
+  - project: dso-templates/ci-cd-components/template-common-lib
+    ref: feature/artifactory-push
+    file:
+      - 'templates/pipeline-stages.gitlab-ci-cd.yml'
+      - 'templates/variables.gitlab-ci.yml'
+      - 'templates/common-functions.gitlab.yml'
+      - 'templates/compliance-framework-placeholder-jobs.gitlab-ci.yml'
+      - 'templates/workflow-rules.gitlab-ci-cd.yml'
+  - project: dso-templates/ci-cd-components/python-ci
+    ref: v1.2.0
+    file: 'templates/python-ci.gitlab.yml'
+
+  - project: dso-templates/ci-cd-components/docker-cd
+    ref: feature/jfrog-image-push
+    file: 'templates/docker.yml'
+    rules:
+      - if: '$IS_ARTIFACTORY_ENABLED == "true"'
+
+  - project: dso-templates/ci-cd-components/openshift-cd
+    ref: feature/artifactory-ose
+    file: 'templates/openshift.yml'
+    rules:
+      - if: '$IS_ARTIFACTORY_ENABLED == "true"'
+
+package:build:
+  image: code.gitlab.prod.us-west-2.tlz.svbank.com:5050/container-factory/purpose-built/python3/python3:3.12.13-a20e5347
+  script:
+    - CI_NEXUS_PASSWORD=$(cyberArkCredentials ${NEXUS_CYBERARK_ACC_NAME})
+    - python3 -m pip config set global.break-system-packages true
+    - pythonValidation
+    - pythonPreConfigArtifacts
+    - buildPythonPackage
+
