@@ -504,9 +504,11 @@ async def route_to_service(
     )
     
     # Get service token
-    headers = await token_manager.get_auth_header()
+    headers = await token_manager.get_auth_header(job_type.value)
     headers["Content-Type"] = "application/json"
-    
+
+    logger.info(f"Auth header present: {'Authorization' in headers}")
+
     # CRITICAL: Propagate correlation ID to downstream service
     correlation_id = get_correlation_id()
     if correlation_id:
