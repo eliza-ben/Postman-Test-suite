@@ -1,0 +1,310 @@
+"""
+Avro Schema Validation - Data Quality and Type Checking
+
+This module provides Avro schema validation for all GenFlowCrafter services
+to ensure data quality and type safety throughout the ETL pipeline.
+
+Key Features:
+-------------
+1. Batch Validation - Validate entire batches of records
+2. Single Record Validation - Validate individual records
+3. Type Checking - Ensure correct data types
+4. Required Fields - Validate required fields exist
+5. Schema Compliance - Ensure data matches schema structure
+
+Supported Avro Types:
+---------------------
+- Primitives: int, long, float, double, string, boolean, null
+- Complex: array, record, map, union
+- Logical: date, timestamp, decimal
+
+Usage:
+------
+    from common.avro import validate_batch_list, validate_record
+    
+    schema = {
+        "type": "record",
+        "name": "User",
+        "fields": [
+            {"name": "id", "type": "int"},
+            {"name": "name", "type": "string"}
+        ]
+    }
+    
+    # Validate batch
+    validate_batch_list(records, schema)
+    
+    # Validate single record
+    validate_record(record, schema)
+
+Benefits:
+---------
+- Early error detection
+- Data quality assurance
+- Type safety
+- Schema evolution support
+- Fast validation with fastavro
+"""
+
+from typing import Any, Dict, List, Iterator
+from fastapi import HTTPException
+import fastavro
+from fastavro.validation import validate
+
+
+def normalize_union_types(record: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize union type values for Avro compatibility.
+    
+    Handles cases where union types like ["null", "int"] need to be converted
+    to simple types for target schemas.
+    
+    Args:
+        record: Record dictionary to normalize
+        schema: Avro schema dictionary
+        
+    Returns:
+        Normalized record dictionary
+    """
+    if "fields" not in schema:
+        return record
+    
+    normalized = record.copy()
+    
+    for field in schema["fields"]:
+        field_name = field["name"]
+        field_type = field["type"]
+        
+        if field_name not in normalized:
+            continue
+            
+        value = normalized[field_name]
+        
+        # Handle union types
+        if isinstance(field_type, list):
+            # This is a union type like ["null", "int"]
+            if value is None:
+                # null is always valid in union types
+                continue
+            
+            # Find the appropriate non-null type in the union
+            for union_type in field_type:
+                if union_type == "null":
+                    continue
+                    
+                try:
+                    # Handle int/long types
+                    if union_type in ["int", "long"]:
+                        if isinstance(value, str):
+                            # Handle string numbers (including negative)
+                            if value.lstrip('-').isdigit():
+                                normalized[field_name] = int(value)
+                                break
+                        elif isinstance(value, (int, float)):
+                            normalized[field_name] = int(value)
+                            break
+                    
+                    # Handle float/double types  
+                    elif union_type in ["float", "double"]:
+                        if isinstance(value, str):
+                            normalized[field_name] = float(value)
+                            break
+                        elif isinstance(value, (int, float)):
+                            normalized[field_name] = float(value)
+                            break
+                    
+                    # Handle string types
+                    elif union_type == "string":
+                        if not isinstance(value, str):
+                            normalized[field_name] = str(value)
+                            break
+                        else:
+                            # Already a string, keep as-is
+                            break
+                    
+                    # Handle boolean types
+                    elif union_type == "boolean":
+                        if isinstance(value, str):
+                            if value.lower() in ['true', '1', 'yes']:
+                                normalized[field_name] = True
+                                break
+                            elif value.lower() in ['false', '0', 'no']:
+                                normalized[field_name] = False
+                                break
+                        elif isinstance(value, bool):
+                            break  # Already correct type
+                    
+                    # If the value is already the correct type for this union member
+                    elif (union_type == "int" and isinstance(value, int)) or \
+                         (union_type == "long" and isinstance(value, int)) or \
+                         (union_type == "float" and isinstance(value, float)) or \
+                         (union_type == "double" and isinstance(value, float)) or \
+                         (union_type == "string" and isinstance(value, str)) or \
+                         (union_type == "boolean" and isinstance(value, bool)):
+                        # Value is already the correct type, no conversion needed
+                        break
+                        
+                except (ValueError, TypeError):
+                    continue
+    
+    return normalized
+
+
+def normalize_records_for_schema(records: List[Dict[str, Any]], schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Normalize a list of records for Avro schema compatibility.
+    
+    This is particularly useful after JOLT transformations where field types
+    might need adjustment for the target schema.
+    
+    Args:
+        records: List of record dictionaries to normalize
+        schema: Target Avro schema dictionary
+        
+    Returns:
+        List of normalized record dictionaries
+    """
+    return [normalize_union_types(record, schema) for record in records]
+
+
+def validate_record(record: Dict[str, Any], schema: Dict[str, Any]) -> None:
+    """
+    Validate a single record against an Avro schema.
+    
+    Provides enhanced error messages for common issues like union type mismatches.
+    
+    Args:
+        record: Record dictionary to validate
+        schema: Avro schema dictionary
+        
+    Raises:
+        HTTPException: 400 if validation fails
+    """
+    try:
+        # Parse schema to ensure it's valid
+        parsed_schema = fastavro.parse_schema(schema)
+        
+        # Normalize union types before validation
+        normalized_record = normalize_union_types(record, schema)
+        
+        # Validate normalized record
+        is_valid = validate(normalized_record, parsed_schema, raise_errors=False)
+        if not is_valid:
+            # Re-validate with errors to get detailed message
+            validate(normalized_record, parsed_schema, raise_errors=True)
+    
+    except Exception as e:
+        error_msg = str(e)
+        
+        # Enhance error messages for common union type issues
+        if "union" in error_msg.lower() and "null" in error_msg.lower():
+            error_msg += " (Hint: For union types like ['null', 'string'], ensure non-null values are properly typed. Empty strings should remain as empty strings, not null.)"
+        
+        raise HTTPException(
+            status_code=400,
+            detail=f"Avro validation failed: {error_msg}",
+        )
+
+
+def validate_batch(
+    records: Iterator[Dict[str, Any]],
+    schema: Dict[str, Any],
+    batch_size: int = 1000,
+) -> Iterator[Dict[str, Any]]:
+    """
+    Validate records in batches, yielding valid records.
+    Short-circuits on first error for fail-fast behavior.
+    
+    Args:
+        records: Iterator of record dictionaries
+        schema: Avro schema dictionary
+        batch_size: Number of records to validate before yielding
+        
+    Yields:
+        Validated record dictionaries
+        
+    Raises:
+        HTTPException: 400 if any validation fails
+    """
+    try:
+        parsed_schema = fastavro.parse_schema(schema)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid Avro schema: {str(e)}",
+        )
+    
+    batch = []
+    record_count = 0
+    
+    for record in records:
+        try:
+            # Normalize union types before validation
+            normalized_record = normalize_union_types(record, schema)
+            
+            is_valid = validate(normalized_record, parsed_schema, raise_errors=False)
+            if not is_valid:
+                validate(normalized_record, parsed_schema, raise_errors=True)
+            
+            batch.append(normalized_record)
+            record_count += 1
+            
+            if len(batch) >= batch_size:
+                yield from batch
+                batch = []
+        
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Enhance error messages for common union type issues
+            if "union" in error_msg.lower() and "null" in error_msg.lower():
+                error_msg += " (Hint: For union types like ['null', 'string'], ensure non-null values are properly typed. Empty strings should remain as empty strings, not null.)"
+            
+            raise HTTPException(
+                status_code=400,
+                detail=f"Avro validation failed at record {record_count}: {error_msg}",
+            )
+    
+    # Yield remaining records
+    if batch:
+        yield from batch
+
+
+def validate_batch_list(records: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
+    """
+    Validate a list of records against an Avro schema.
+    
+    Args:
+        records: List of record dictionaries
+        schema: Avro schema dictionary
+        
+    Raises:
+        HTTPException: 400 if any validation fails
+    """
+    try:
+        parsed_schema = fastavro.parse_schema(schema)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid Avro schema: {str(e)}",
+        )
+    
+    for idx, record in enumerate(records):
+        try:
+            # Normalize union types before validation
+            normalized_record = normalize_union_types(record, schema)
+            
+            is_valid = validate(normalized_record, parsed_schema, raise_errors=False)
+            if not is_valid:
+                validate(normalized_record, parsed_schema, raise_errors=True)
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Enhance error messages for common union type issues
+            if "union" in error_msg.lower() and "null" in error_msg.lower():
+                error_msg += " (Hint: For union types like ['null', 'string'], ensure non-null values are properly typed. Empty strings should remain as empty strings, not null.)"
+            
+            raise HTTPException(
+                status_code=400,
+                detail=f"Avro validation failed at record {idx}: {error_msg}",
+            )
