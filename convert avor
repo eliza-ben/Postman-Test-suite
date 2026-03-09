@@ -1,0 +1,143 @@
+    def convert_datatypes_for_avro_compatibility(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Convert various data types to Avro-compatible formats (primarily strings).
+        
+        This method standardizes data from different sources (APIs, databases, files)
+        into consistent string representations that work well with Avro schemas.
+        
+        Special handling for Avro union types:
+        - For union types like ["null", "string"], preserves non-null values as strings
+        - Only converts to null if the original value is explicitly null/None
+        - Ensures empty strings are preserved (not converted to null)
+        
+        Handles:
+        - Date/DateTime/Time objects -> ISO strings
+        - Decimal -> string (preserves precision)
+        - UUID -> string
+        - Binary data -> UTF-8 string or base64
+        - JSON/dict/list -> JSON string
+        - Custom objects -> string representation
+        - Empty strings -> preserved as empty strings (not null)
+        - Error handling with fallbacks
+        
+        Args:
+            records: List of record dictionaries
+            
+        Returns:
+            List of records with converted data types
+        """
+        import datetime as dt
+        import decimal
+        import uuid
+        import json
+        import base64
+        
+        converted_records = []
+        
+        if self.logger:
+            self.logger.debug(f"Converting {len(records)} records for Avro compatibility")
+        
+        for record in records:
+            converted = {}
+            
+            for key, value in record.items():
+                # CRITICAL: Only set to None if value is explicitly None
+                # This preserves empty strings, zeros, and false values for Avro union types
+                if value is None:
+                    converted[key] = None
+                    continue
+                
+                try:
+                    # String types - preserve as-is (including empty strings)
+                    # This is critical for Avro union types like ["null", "string"]
+                    if isinstance(value, str):
+                        # Special handling for string representations of numbers
+                        # This helps with union type conversions like ["null", "int"] -> int
+                        if value.isdigit() or (value.startswith('-') and value[1:].isdigit()):
+                            try:
+                                # Try to convert string numbers back to int for union type compatibility
+                                converted[key] = int(value)
+                            except ValueError:
+                                converted[key] = value  # Keep as string if conversion fails
+                        else:
+                            converted[key] = value  # Preserve empty strings, don't convert to null
+                    
+                    # Numeric types - preserve as-is for union compatibility
+                    elif isinstance(value, (int, float, bool)):
+                        converted[key] = value  # Keep numbers and booleans as-is
+                    
+                    # Date and DateTime types
+                    elif isinstance(value, dt.date):
+                        converted[key] = value.isoformat()  # Convert to YYYY-MM-DD string
+                    elif isinstance(value, dt.datetime):
+                        converted[key] = value.isoformat()  # Convert to ISO datetime string
+                    elif isinstance(value, dt.time):
+                        converted[key] = value.isoformat()  # Convert to HH:MM:SS string
+                    elif isinstance(value, dt.timedelta):
+                        converted[key] = str(value)  # Convert to string representation
+                    
+                    # Decimal types - convert to string to preserve precision
+                    elif isinstance(value, decimal.Decimal):
+                        converted[key] = str(value)  # Preserve precision as string
+                    
+                    # UUID/GUID types
+                    elif isinstance(value, uuid.UUID):
+                        converted[key] = str(value)  # Convert to string representation
+                    
+                    # Binary data types
+                    elif isinstance(value, (bytes, bytearray)):
+                        try:
+                            # Try to decode as UTF-8 first
+                            converted[key] = value.decode('utf-8')
+                        except UnicodeDecodeError:
+                            # Fall back to base64 encoding for binary data
+                            converted[key] = base64.b64encode(value).decode('ascii')
+                            if self.logger:
+                                self.logger.debug(f"Converted binary field '{key}' to base64")
+                    
+                    # JSON/JSONB types (dict/list from database or file parsing)
+                    elif isinstance(value, (dict, list)):
+                        converted[key] = json.dumps(value, ensure_ascii=False)
+                    
+                    # Array types (PostgreSQL arrays come as tuples)
+                    elif isinstance(value, tuple) and hasattr(value, '__iter__'):
+                        converted[key] = json.dumps(list(value), ensure_ascii=False)
+                    
+                    # Enum types and other custom objects
+                    elif hasattr(value, '__str__') and not isinstance(value, (str, int, float, bool)):
+                        original_type = type(value).__name__
+                        converted[key] = str(value)  # Convert custom objects to string
+                        if self.logger:
+                            self.logger.debug(f"Converted field '{key}' from {original_type} to string: {converted[key]}")
+                    
+                    # Fallback: keep value as-is
+                    else:
+                        converted[key] = value
+                        
+                except Exception as conversion_error:
+                    # Log the error but continue processing
+                    if self.logger:
+                        self.logger.warning(
+                            f"Failed to convert field '{key}' (type: {type(value).__name__}, "
+                            f"value: {repr(value)}): {conversion_error}"
+                        )
+                    
+                    # Fall back to string conversion
+                    try:
+                        converted[key] = str(value)
+                        if self.logger:
+                            self.logger.debug(f"Fallback string conversion for field '{key}': {converted[key]}")
+                    except Exception:
+                        # CRITICAL: Only set to None if value was originally None
+                        # For Avro union types like ["null", "string"], preserve the original value
+                        if value is None:
+                            converted[key] = None
+                        else:
+                            # Keep original value if all conversions fail - this preserves union type compatibility
+                            converted[key] = value
+                            if self.logger:
+                                self.logger.warning(f"Could not convert field '{key}', preserving original value: {repr(value)}")
+            
+            converted_records.append(converted)
+        
+        return converted_records
