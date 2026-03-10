@@ -1,0 +1,283 @@
+"""
+Authentication and Authorization - JWT and Basic Auth Support
+
+This module provides authentication and authorization for all GenFlowCrafter services
+with support for JWT tokens and Basic authentication.
+
+Key Features:
+-------------
+1. JWT Token Validation - Validates JWT tokens via security gateway
+2. Basic Authentication - Username/password authentication
+3. JWKS Caching - Caches JSON Web Key Sets for performance
+4. User Extraction - Extracts username/subject from tokens
+5. FastAPI Integration - Works as FastAPI dependency
+
+Authentication Flow:
+--------------------
+1. Client sends request with Authorization header
+2. Service extracts token (Bearer or Basic)
+3. JWT: Validates against JWKS from security gateway
+4. Basic: Validates credentials via security gateway
+5. Returns user context (username, subject)
+
+Usage:
+------
+    from common.auth import verify_jwt_or_basic
+    from fastapi import Depends
+    
+    @app.post("/endpoint")
+    async def endpoint(auth: Dict = Depends(verify_jwt_or_basic)):
+        # auth contains: {"username": "...", "subject": "..."}
+        user = auth.get("username")
+        subject = auth.get("subject")
+
+Configuration:
+--------------
+Environment Variables:
+    JWT_ISSUER: JWT issuer URL (default: https://etl.example.com)
+    JWT_AUDIENCE: JWT audience (default: etl-services)
+    JWT_CLOCK_SKEW_SEC: Clock skew tolerance (default: 60)
+    JWKS_URL: JWKS endpoint URL
+    SECURITY_BASE_URL: Security gateway base URL
+
+Security:
+---------
+- JWT signature validation
+- Token expiry checking
+- Clock skew tolerance
+- JWKS caching (5 minute TTL)
+- Secure credential transmission
+"""
+
+import os
+import base64
+from typing import Optional
+from datetime import datetime, timedelta
+import httpx
+from fastapi import HTTPException, Request, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+# Fix for https://snyk.io/vuln/SNYK-PYTHON-ECDSA-6184115
+# from jose import jwt, JWTError, jwk
+# from jose.backends import RSAKey
+import jwt
+from jwt.exceptions import PyJWTError
+from jwt.algorithms import RSAAlgorithm
+
+
+# JWT configuration from environment
+JWT_ISSUER = os.getenv("JWT_ISSUER", "https://etl.example.com")
+JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "etl-services")
+JWT_CLOCK_SKEW_SEC = int(os.getenv("JWT_CLOCK_SKEW_SEC", "60"))
+JWKS_URL = os.getenv("JWKS_URL", "http://security-gateway:8088/v1/.well-known/jwks.json")
+SECURITY_BASE_URL = os.getenv("SECURITY_BASE_URL", "http://security-gateway:8088")
+
+# Cache for JWKS
+_jwks_cache: Optional[dict] = None
+_jwks_cache_time: Optional[datetime] = None
+JWKS_CACHE_TTL = timedelta(minutes=5)
+
+
+security = HTTPBearer(auto_error=False)
+
+
+async def get_jwks() -> dict:
+    """
+    Fetch JWKS from security gateway with caching.
+    
+    Returns:
+        JWKS dictionary
+    """
+    global _jwks_cache, _jwks_cache_time
+    
+    now = datetime.utcnow()
+    
+    # Return cached JWKS if still valid
+    if _jwks_cache and _jwks_cache_time and (now - _jwks_cache_time) < JWKS_CACHE_TTL:
+        return _jwks_cache
+    
+    # Fetch fresh JWKS
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(JWKS_URL)
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to fetch JWKS ({response.status_code})",
+                )
+            
+            jwks = response.json()
+            _jwks_cache = jwks
+            _jwks_cache_time = now
+            return jwks
+    
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"JWKS fetch error: {str(e)}",
+        )
+
+
+async def verify_jwt_token(token: str) -> dict:
+    """
+    Verify JWT token using JWKS.
+    
+    Args:
+        token: JWT token string
+        
+    Returns:
+        Decoded token payload
+        
+    Raises:
+        HTTPException: 401 if token is invalid
+    """
+    try:
+        # Get JWKS
+        jwks = await get_jwks()
+        
+        # Decode header to get kid
+        unverified_header = jwt.get_unverified_header(token)
+        kid = unverified_header.get("kid")
+        
+        if not kid:
+            raise HTTPException(status_code=401, detail="Token missing 'kid' in header")
+        
+        # Find matching key
+        key_data = None
+        for key in jwks.get("keys", []):
+            if key.get("kid") == kid:
+                key_data = key
+                break
+        
+        if not key_data:
+            raise HTTPException(status_code=401, detail=f"No matching key for kid '{kid}'")
+        
+        # # Verify and decode token
+        # payload = jwt.decode(
+        #     token,
+        #     key_data,
+        #     algorithms=["RS256"],
+        #     issuer=JWT_ISSUER,
+        #     audience=JWT_AUDIENCE,
+        #     options={
+        #         "verify_signature": True,
+        #         "verify_exp": True,
+        #         "verify_iat": True,
+        #         "verify_aud": True,
+        #         "verify_iss": True,
+        #         "leeway": JWT_CLOCK_SKEW_SEC,
+        #     },
+        # )
+
+        # Fix for https://snyk.io/vuln/SNYK-PYTHON-ECDSA-6184115
+        public_key = RSAAlgorithm.from_jwk(key_data)
+
+        payload = jwt.decode(
+            token,
+            public_key,
+            algorithms=["RS256"],
+            issuer=JWT_ISSUER,
+            audience=JWT_AUDIENCE,
+            options={
+                "verify_signature": True,
+                "verify_exp": True,
+                "verify_iat": True,
+                "verify_aud": True,
+                "verify_iss": True,
+                "leeway": JWT_CLOCK_SKEW_SEC,
+            },
+        )
+        
+        return payload
+
+    # Fix for https://snyk.io/vuln/SNYK-PYTHON-ECDSA-6184115
+    # except JWTError as e:
+    except PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid JWT: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(e)}")
+
+
+async def verify_basic_auth(username: str, password: str) -> bool:
+    """
+    Verify Basic Auth credentials via security gateway.
+    
+    Args:
+        username: Username
+        password: Password
+        
+    Returns:
+        True if valid, False otherwise
+    """
+    url = f"{SECURITY_BASE_URL}/v1/auth/basic/verify"
+    payload = {
+        "username": username,
+        "password": password,
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(url, json=payload)
+            return response.status_code == 200
+    
+    except Exception:
+        return False
+
+
+async def verify_jwt_or_basic(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> dict:
+    """
+    FastAPI dependency to verify JWT or Basic Auth.
+    
+    Args:
+        request: FastAPI request
+        credentials: HTTP credentials from bearer token
+        
+    Returns:
+        Authentication context (user info from JWT or Basic)
+        
+    Raises:
+        HTTPException: 401 if authentication fails
+    """
+    # Try Authorization header first
+    auth_header = request.headers.get("Authorization", "")
+    
+    # JWT Bearer token
+    if auth_header.startswith("Bearer ") and credentials:
+        token = credentials.credentials
+        payload = await verify_jwt_token(token)
+        return {
+            "type": "jwt",
+            "subject": payload.get("sub"),
+            "client_id": payload.get("client_id"),
+            "payload": payload,
+        }
+    
+    # Basic Auth
+    if auth_header.startswith("Basic "):
+        try:
+            encoded = auth_header.replace("Basic ", "")
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            username, password = decoded.split(":", 1)
+            
+            is_valid = await verify_basic_auth(username, password)
+            if is_valid:
+                return {
+                    "type": "basic",
+                    "username": username,
+                }
+            else:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Basic auth failed: {str(e)}")
+    
+    # No valid authentication
+    raise HTTPException(
+        status_code=401,
+        detail="Missing or invalid authentication. Provide JWT Bearer or Basic Auth.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
