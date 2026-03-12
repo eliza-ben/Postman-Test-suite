@@ -110,3 +110,6 @@ WHERE a.account_description NOT IN ('RELATIONSHIP SUMMARY');
 
 TO_CHAR(DATE_TRUNC('month', TO_DATE(MIN(from_dt), 'YYYYMMDD')) + INTERVAL '1 month', 'YYYY-MM-01')
 
+
+TO_DATE(TO_CHAR(TO_DATE(MIN(from_dt), 'YYYYMMDD') + INTERVAL '1 month', 'YYYYMM') || '01', 'YYYYMMDD')
+
