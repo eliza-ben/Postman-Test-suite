@@ -106,3 +106,7 @@ JOIN (
     AND a.correlation_id = b.correlation_id
 WHERE a.account_description NOT IN ('RELATIONSHIP SUMMARY');
 
+
+
+TO_CHAR(DATE_TRUNC('month', TO_DATE(MIN(from_dt), 'YYYYMMDD')) + INTERVAL '1 month', 'YYYY-MM-01')
+
