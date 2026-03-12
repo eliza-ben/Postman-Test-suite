@@ -116,3 +116,6 @@ TO_DATE(TO_CHAR(TO_DATE(MIN(from_dt), 'YYYYMMDD') + INTERVAL '1 month', 'YYYYMM'
     TO_CHAR(TO_DATE(TO_CHAR(TO_DATE(MIN(invoice_dt), 'YYYYMMDD') + INTERVAL '1 month', 'YYYYMM') || '01', 'YYYYMMDD'),'DD-Mon-YYYY') AS due_date,
 
 
+TO_CHAR(TO_DATE(MIN(invoice_dt), 'YYYYMMDD') + INTERVAL '1 month', '01-Mon-YYYY') AS due_date
+
+
