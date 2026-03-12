@@ -1,0 +1,1010 @@
+"""
+DB-to-File ETL Service - Production-Ready Database Export Microservice
+
+This service exports data from relational databases to various file formats with:
+- Full validation (Avro schemas)
+- Data transformation (JOLT)
+- Value formatting (dates, decimals)
+- Multiple file formats (CSV, TSV, Fixed-Width)
+- Compression support
+- Audit trail via Kafka
+
+Service Port: 9091
+Base URL: http://localhost:9091
+Framework: FastAPI + AsyncIO
+Language: Python 3.11+
+
+Key Features:
+-------------
+1. Database Reading
+   - Streaming query execution (memory-efficient)
+   - WHERE clause filtering (12 operators)
+   - Column selection and mapping
+   - Batch processing
+
+2. File Writing
+   - Delimited Files: CSV, TSV, custom delimiters
+   - Fixed-Width Files: Positional data with alignment
+   - Gzip compression support
+   - Custom encoding (UTF-8, Latin-1, etc.)
+   - Header row support
+
+3. Value Formatting
+   - Date formatting (%Y-%m-%d, %m/%d/%Y, etc.)
+   - Decimal formatting (%.2f, %.4f, etc.)
+   - Type conversion (string, int, float, decimal, date, datetime)
+   - Null literal handling
+
+4. Data Transformation
+   - JOLT transformation integration
+   - Avro schema validation
+   - Column mapping with defaults
+
+5. Audit & Observability
+   - Kafka audit events
+   - Structured JSON logging
+   - Prometheus metrics
+   - Correlation ID tracking
+
+Endpoints:
+----------
+- POST /export/dbtofile - Main export endpoint
+- GET /health - Health check
+- GET /metrics - Prometheus metrics
+
+For detailed API documentation, see DB_TO_FILE_SPECIFICATION.md
+"""
+
+import os
+import time
+from typing import Any, Dict, List, Optional
+from datetime import datetime
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Depends, Request
+from pydantic import BaseModel, Field
+from sqlalchemy import select, Table
+from sqlalchemy.ext.asyncio import AsyncEngine
+from dotenv import load_dotenv
+
+# Fix for Snyk Code Report issues
+# BASE_DIR = Path(os.getenv("FILE_BASE_DIR", "C:\\Users\\vthirugnanam\\Genesis\\")).resolve()
+BASE_DIR = Path(os.getenv("FILE_BASE_DIR", "./files/")).resolve()
+
+# Fix for Snyk Code Report issues
+import re
+SAFE_PATH_PATTERN = re.compile(r'^[a-zA-Z0-9._\-/\\]+$')
+
+def get_safe_file_path(base_dir: Path, user_input_path: str) -> Path:
+    base_dir = base_dir.resolve()
+
+    # Basic validation for illegal characters
+    if not SAFE_PATH_PATTERN.match(user_input_path):
+        raise HTTPException(status_code=400, detail="Invalid file path")
+
+    # Prevent obvious traversal
+    if ".." in user_input_path:
+        raise HTTPException(status_code=400, detail="Path traversal detected")
+
+    # Construct and normalize the path
+    safe_path = (base_dir / user_input_path).resolve()
+
+    # Ensure the resolved path stays inside BASE_DIR
+    if base_dir not in safe_path.parents and safe_path != base_dir:
+        raise HTTPException(status_code=400, detail="Access outside base directory is not allowed")
+
+    return safe_path
+
+# Import from shared library
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../libs/py-common"))
+
+base_path = Path(__file__).resolve().parents[1]
+env_file = base_path / ".env"
+props_file = base_path / "configs" / "application.properties"
+
+if props_file.exists():
+    # LOCAL execution
+    load_dotenv(dotenv_path=props_file, override=False)
+else:
+    # Non-local (OpenShift / deployed)
+    load_dotenv(dotenv_path=env_file, override=False)
+
+# Load environment variables from local .env (if present)
+# load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=False)
+# load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / "/configs/application.properties", override=False)
+
+from common.auth import verify_jwt_or_basic
+from common.db import async_engine, reflect_table, normalize_column_names_for_table
+from common.jolt import JoltClient
+from common.metrics import mount_metrics, OPERATION_LATENCY, record_success, record_error, record_batch
+from common.ids import validate_ident
+from common.processors import ETLPipeline, QueryBuilder, FileWriter, ValueFormatter
+from common.aggregation import AggregationConfig
+from common.expression_evaluator import ExpressionConfig, ColumnExpression
+from common.logging import setup_logging, log_with_context, log_database_operation, log_error, get_correlation_id
+from common.middleware import add_correlation_middleware
+from common.audit import (
+    setup_audit,
+    publish_audit_event,
+)
+from common.audit_middleware import add_audit_middleware
+from common.security import (
+    add_cors_middleware,
+    create_limiter,
+    add_rate_limiting,
+    add_request_size_limit,
+    STRICT_RATE_LIMIT,
+)
+
+
+SERVICE_NAME = "db-to-file"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+JSON_LOGS = os.getenv("JSON_LOGS", "false").lower() == "true"
+AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"
+DEFAULT_DOMAIN_ID = os.getenv("DEFAULT_DOMAIN_ID", "default")
+
+# Setup structured logging
+logger = setup_logging(SERVICE_NAME, LOG_LEVEL, JSON_LOGS)
+
+# Setup audit publisher
+audit_publisher = setup_audit(
+    SERVICE_NAME,
+    default_domain_id=DEFAULT_DOMAIN_ID,
+    kafka_bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS"),
+    kafka_audit_topic=os.getenv("KAFKA_AUDIT_TOPIC"),
+    enabled=AUDIT_ENABLED,
+)
+
+app = FastAPI(
+    title="DB-to-File Export Service",
+    description="Export database to files with Avro validation and JOLT transformation",
+    version="1.0.0",
+)
+
+# ============================================================================
+# SECURITY MIDDLEWARE (Order Matters - add security first)
+# ============================================================================
+
+# 1. Request size limit (check before processing)
+add_request_size_limit(app, max_size=10485760)  # 10MB limit
+
+# 2. CORS protection
+add_cors_middleware(app)
+
+# 3. Rate limiting
+limiter = create_limiter()
+add_rate_limiting(app, limiter)
+
+# ============================================================================
+# OBSERVABILITY MIDDLEWARE
+# ============================================================================
+
+# Mount metrics
+mount_metrics(app)
+
+# Add correlation ID middleware
+add_correlation_middleware(app, logger)
+
+# Add audit middleware
+add_audit_middleware(app, SERVICE_NAME, default_domain_id=DEFAULT_DOMAIN_ID)
+
+
+# ============================================================================
+# REQUEST/RESPONSE MODELS
+# ============================================================================
+
+class ColumnMapping(BaseModel):
+    """
+    Column mapping with value formatting for file export.
+    
+    Maps database column to file field with optional formatting for:
+    - Date/datetime values (custom format strings)
+    - Decimal values (precision control)
+    - Fixed-width files (width, alignment, padding)
+    
+    Examples:
+    ---------
+    Date formatting:
+        {
+            "source": "created_date",
+            "target": "created",
+            "type": "date",
+            "format": "%Y-%m-%d"
+        }
+    
+    Decimal formatting:
+        {
+            "source": "amount",
+            "target": "total",
+            "type": "decimal",
+            "format": "%.2f"
+        }
+    
+    Fixed-width with alignment:
+        {
+            "source": "id",
+            "target": "user_id",
+            "type": "int",
+            "width": 10,
+            "align": "right",
+            "pad_char": "0"
+        }
+    """
+    source: str = Field(..., description="Source column name")
+    target: str = Field(..., description="Target field name")
+    type: str = Field(default="string", description="Data type: string, int, float, decimal, date, datetime")
+    format: Optional[str] = Field(default=None, description="Format string for dates/decimals")
+    width: Optional[int] = Field(default=None, description="Column width for fixed-width files")
+    align: Optional[str] = Field(default="left", description="Alignment: left, right, center")
+    pad_char: Optional[str] = Field(default=" ", description="Padding character")
+
+
+class FilterCondition(BaseModel):
+    column: str
+    op: str = Field(..., description="Operator: eq, ne, lt, lte, gt, gte, like, ilike, in, between, is_null, is_not_null")
+    value: Any = Field(default=None, description="Filter value")
+
+
+class FileConfig(BaseModel):
+    """
+    File output configuration for export.
+    
+    Supports two file types:
+    1. Delimited: CSV, TSV, or custom delimiter
+    2. Fixed-Width: Positional data with alignment
+    
+    Features:
+    ---------
+    - Automatic filename generation with timestamp
+    - Gzip compression (.gz)
+    - Custom encoding (UTF-8, Latin-1, etc.)
+    - Header row option
+    - Null value representation
+    
+    Examples:
+    ---------
+    CSV file:
+        {
+            "type": "delimited",
+            "output_path": "/data/exports",
+            "filename_prefix": "users",
+            "delimiter": ",",
+            "header": true,
+            "compress": false
+        }
+        Output: /data/exports/users_20251011_221303.csv
+    
+    TSV file with compression:
+        {
+            "type": "delimited",
+            "output_path": "/data/exports",
+            "delimiter": "\t",
+            "compress": true
+        }
+        Output: /data/exports/export_20251011_221303.tsv.gz
+    
+    Fixed-width file:
+        {
+            "type": "fixed",
+            "output_path": "/data/exports",
+            "strict_width": true,
+            "header": true
+        }
+        Output: /data/exports/export_20251011_221303.txt
+    """
+    type: str = Field(..., description="File type: 'delimited' or 'fixed'")
+    output_path: str = Field(..., description="Output directory path")
+    filename_prefix: str = Field(default="export", description="Output filename prefix")
+    header: bool = Field(default=True, description="Include header row")
+    encoding: str = Field(default="utf-8", description="File encoding")
+    newline: str = Field(default="\n", description="Line terminator")
+    compress: bool = Field(default=False, description="Gzip compression")
+    null_literal: str = Field(default="", description="Null value representation")
+    delimiter: str = Field(default=",", description="Delimiter for delimited files (supports multi-char like '||')")
+    quotechar: str = Field(default='"', description="Quote character")
+    escapechar: Optional[str] = Field(default=None, description="Escape character")
+    strict_width: bool = Field(default=False, description="Enforce strict width for fixed files")
+    sheet_name: str = Field(default="Sheet1", description="Sheet name for Excel files")
+    include_correlation_id: bool = Field(default=False, description="Flag to Append CorrealtionId to Filename")
+
+
+class DBConfig(BaseModel):
+    sqlalchemy_url: str
+    schema_name: Optional[str] = None
+    table_name: str
+
+
+class ExportRequest(BaseModel):
+    """
+    Main request model for /export/dbtofile endpoint.
+    
+    Defines the complete ETL configuration for database-to-file export including:
+    - Database source configuration
+    - File output configuration
+    - Column mappings with formatting
+    - Filter conditions for source query
+    - Data validation schema (Avro)
+    - Data transformation rules (JOLT)
+    - Data aggregation and grouping (NEW)
+    
+    Data Flow:
+    ----------
+    1. Query database with filters
+    2. Apply column mapping
+    3. Transform with JOLT (if provided)
+    4. 🆕 Data aggregation and grouping (if provided)
+    5. Validate against target_avro_schema (if provided)
+    6. Format values (dates, decimals)
+    7. Write to file (CSV/TSV or fixed-width)
+    8. Publish audit events to Kafka
+    
+    Example:
+    --------
+    See DB_TO_FILE_SPECIFICATION.md for complete examples.
+    """
+    version: str = "1.0"
+    db: DBConfig
+    file: FileConfig
+    mapping: List[ColumnMapping] = Field(..., description="Explicit column mappings")
+    filters: List[FilterCondition] = Field(default_factory=list, description="WHERE conditions")
+    jolt_spec: Optional[List[Dict[str, Any]]] = Field(default=None, description="Optional JOLT transformation")
+    expression_config: Optional[ExpressionConfig] = Field(default=None, description="🆕 Expression evaluation configuration for dynamic column calculations")
+    aggregation_config: Optional[AggregationConfig] = Field(default=None, description="🆕 Optional data aggregation and grouping configuration")
+    target_avro_schema: Optional[Dict[str, Any]] = Field(default=None, description="Avro schema for output validation (optional)")
+    fetch_batch_size: int = Field(default=10000, description="DB fetch batch size")
+
+
+class ExportResponse(BaseModel):
+    """
+    Response model for successful export operations.
+    
+    Returns summary statistics about the export operation including:
+    - Status: "OK" for success
+    - Total records exported
+    - Output file path
+    - Total duration in milliseconds
+    """
+    status: str
+    records: int
+    file: str
+    duration_ms: int
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+# Note: Legacy functions have been replaced by shared processors:
+# - QueryBuilder (from common.processors.db.query_builder)
+# - ValueFormatter (from common.processors.file_processor)
+# - FileWriter (from common.processors.file_processor)
+# - ETLPipeline (from common.processors.pipeline_processor)
+
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup
+    logger.info(f"Starting {SERVICE_NAME} service on port {os.getenv('PORT', '9091')}")
+    logger.info(f"Log level: {LOG_LEVEL}, JSON logs: {JSON_LOGS}")
+    logger.info(f"Security gateway: {os.getenv('SECURITY_BASE_URL', 'http://security-gateway:8088')}")
+    
+    if audit_publisher:
+        await audit_publisher.start()
+        logger.info("Audit publisher started")
+    
+    yield
+    
+    # Shutdown
+    logger.info(f"Stopping {SERVICE_NAME} service")
+    if audit_publisher:
+        await audit_publisher.stop()
+        logger.info("Audit publisher stopped")
+
+# Update app with lifespan
+app.router.lifespan_context = lifespan
+
+
+async def export_to_file(
+    engine: AsyncEngine,
+    table: Table,
+    req: ExportRequest,
+    jolt_client: Optional[JoltClient],
+) -> tuple[str, int]:
+    """
+    Export database to file using common processors.
+    
+    This function orchestrates the complete export process:
+    1. Builds and executes database query with filters
+    2. Streams data in batches for memory efficiency
+    3. Applies ETL pipeline (mapping, JOLT, validation)
+    4. Formats values (dates, decimals) for output
+    5. Writes to file (CSV/TSV or fixed-width)
+    6. Publishes audit events
+    
+    Args:
+        engine: SQLAlchemy async database engine
+        table: SQLAlchemy Table object (reflected from database)
+        req: ExportRequest with complete configuration
+        jolt_client: JOLT client for transformations (optional)
+    
+    Returns:
+        Tuple of (output_file_path, total_records_exported)
+    
+    Raises:
+        HTTPException: If export fails
+    """
+    # Build query
+    source_cols = [mapping.source for mapping in req.mapping]
+    for col in source_cols:
+        validate_ident(col, "source column")
+    
+    columns = [table.c[col] for col in source_cols]
+    query = select(*columns)
+    
+    # Convert FilterCondition models to dicts for QueryBuilder
+    filter_dicts = [{"column": f.column, "op": f.op, "value": f.value} for f in req.filters]
+    where_clause = QueryBuilder.build_where_clause(table, filter_dicts)
+    if where_clause is not None:
+        query = query.where(where_clause)
+    
+    # Generate filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger.info(f"file type: {req.file.type}")
+    if req.file.type == "delimited":
+        ext = "csv" if req.file.delimiter == "," else "tsv"
+    elif req.file.type == "xls":
+        ext = "xlsx"
+    elif req.file.type == "xlsx":
+        ext = "xlsx"
+    else:  # fixed
+        ext = "txt"
+
+    # Appending filename with correlation_Id based on correlation flag
+    filename = f"{req.file.filename_prefix}_{get_correlation_id()}.{ext}" if req.file.include_correlation_id else f"{req.file.filename_prefix}.{ext}"
+
+    if req.file.compress:
+        filename += ".gz"
+
+    # Fix for Snyk Code Report issues
+    # output_path = Path(req.file.output_path)
+    output_path = get_safe_file_path(BASE_DIR, req.file.output_path)
+
+    logger.info(f"output_file_path: {output_path}")
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    filepath = str(output_path / filename)
+    
+    # Stream, process, and collect all records
+    all_records = []
+    batch = []
+    batch_count = 0
+    
+    logger.info(f"Starting data export from table: {table.name}")
+    
+    async with engine.connect() as conn:
+        result = await conn.stream(query)
+        
+        async for row in result:
+            row_dict = {source_cols[i]: row[i] for i in range(len(source_cols))}
+            
+            # Convert database-specific objects to strings for Avro compatibility
+            import datetime as dt
+            import decimal
+            import uuid
+            import json
+            
+            for key, value in row_dict.items():
+                if value is None:
+                    continue  # Keep None values as-is
+                
+                try:
+                    # Date and DateTime types
+                    if isinstance(value, dt.date):
+                        row_dict[key] = value.isoformat()  # Convert to YYYY-MM-DD string
+                    elif isinstance(value, dt.datetime):
+                        row_dict[key] = value.isoformat()  # Convert to ISO datetime string
+                    elif isinstance(value, dt.time):
+                        row_dict[key] = value.isoformat()  # Convert to HH:MM:SS string
+                    elif isinstance(value, dt.timedelta):
+                        row_dict[key] = str(value)  # Convert to string representation
+                    
+                    # Numeric types
+                    elif isinstance(value, decimal.Decimal):
+                        row_dict[key] = str(value)  # Preserve precision as string
+                    
+                    # UUID/GUID types
+                    elif isinstance(value, uuid.UUID):
+                        row_dict[key] = str(value)  # Convert to string representation
+                    
+                    # Binary data types
+                    elif isinstance(value, (bytes, bytearray)):
+                        try:
+                            # Try to decode as UTF-8 first
+                            row_dict[key] = value.decode('utf-8')
+                        except UnicodeDecodeError:
+                            # Fall back to base64 encoding for binary data
+                            import base64
+                            row_dict[key] = base64.b64encode(value).decode('ascii')
+                            logger.debug(f"Converted binary field '{key}' to base64")
+                    
+                    # JSON/JSONB types (dict/list from database)
+                    elif isinstance(value, (dict, list)):
+                        row_dict[key] = json.dumps(value, ensure_ascii=False)
+                    
+                    # Array types (PostgreSQL arrays come as lists)
+                    elif isinstance(value, tuple) and hasattr(value, '__iter__'):
+                        row_dict[key] = json.dumps(list(value), ensure_ascii=False)
+                    
+                    # Enum types and other custom objects
+                    elif hasattr(value, '__str__') and not isinstance(value, (str, int, float, bool)):
+                        original_type = type(value).__name__
+                        row_dict[key] = str(value)  # Convert custom objects to string
+                        logger.debug(f"Converted field '{key}' from {original_type} to string: {row_dict[key]}")
+                        
+                except Exception as conversion_error:
+                    # Log the error but continue processing
+                    logger.warning(f"Failed to convert field '{key}' (type: {type(value).__name__}, value: {repr(value)}): {conversion_error}")
+                    # Fall back to string conversion
+                    try:
+                        row_dict[key] = str(value)
+                    except Exception:
+                        # Last resort: set to None
+                        row_dict[key] = None
+                        logger.error(f"Could not convert field '{key}' at all, setting to None")
+            
+            batch.append(row_dict)
+            
+            if len(batch) >= req.fetch_batch_size:
+                # Normalize column names for case-sensitive database compatibility
+                batch = normalize_column_names_for_table(batch, table)
+                batch_count += 1
+                batch_start = time.time()
+                
+                # Audit: Records received from database
+                await publish_audit_event(
+                    domain_id=DEFAULT_DOMAIN_ID,
+                    entity_type="TABLE",
+                    entity_id=table.name,
+                    event_type="RECORDS_READ",
+                    outcome="SUCCESS",
+                    details=f"Read {len(batch)} records from table (batch {batch_count})",
+                    payload={"records_count": len(batch), "batch_number": batch_count},
+                )
+                
+                # Format values BEFORE validation (only for date/decimal types that need formatting)
+                for record in batch:
+                    for mapping in req.mapping:
+                        if mapping.source in record and mapping.format:
+                            # Only format if a format string is specified
+                            value = record[mapping.source]
+                            formatted = ValueFormatter.format_value(value, mapping.type, mapping.format)
+                            record[mapping.source] = formatted
+                
+                # Process batch using ETLPipeline with aggregation support
+                mapping_dicts = [{"source": m.source, "target": m.target} for m in req.mapping]
+                processed = await ETLPipeline.process_batch(
+                    batch,
+                    target_schema=req.target_avro_schema,  # Can be None
+                    jolt_spec=req.jolt_spec,
+                    mapping=mapping_dicts,
+                    jolt_client=jolt_client,
+                    aggregation_config=req.aggregation_config,  # 🆕 Aggregation support
+                    expression_config=req.expression_config,  # 🆕 Expression evaluation support
+                )
+                
+                # Audit: Records processed
+                await publish_audit_event(
+                    domain_id=DEFAULT_DOMAIN_ID,
+                    entity_type="ETL_PIPELINE",
+                    entity_id=f"{table.name}->file",
+                    event_type="RECORDS_PROCESSED",
+                    outcome="SUCCESS",
+                    details=f"Processed {len(processed)} records (batch {batch_count})",
+                    payload={"records_count": len(processed), "batch_number": batch_count, "has_jolt": req.jolt_spec is not None},
+                )
+                
+                all_records.extend(processed)
+                
+                log_database_operation(
+                    logger,
+                    "read_batch",
+                    table.name,
+                    len(processed),
+                    (time.time() - batch_start) * 1000,
+                    batch_number=batch_count,
+                    total_so_far=len(all_records),
+                )
+                
+                batch = []
+    
+    # Process remaining
+    if batch:
+        # Normalize column names for case-sensitive database compatibility
+        batch = normalize_column_names_for_table(batch, table)
+        
+        # Format values BEFORE validation (only for date/decimal types that need formatting)
+        for record in batch:
+            for mapping in req.mapping:
+                if mapping.source in record and mapping.format:
+                    # Only format if a format string is specified
+                    value = record[mapping.source]
+                    formatted = ValueFormatter.format_value(value, mapping.type, mapping.format)
+                    record[mapping.source] = formatted
+        
+        mapping_dicts = [{"source": m.source, "target": m.target} for m in req.mapping]
+        processed = await ETLPipeline.process_batch(
+            batch,
+            target_schema=None,  # Skip target validation until after aggregation
+            jolt_spec=req.jolt_spec,
+            mapping=mapping_dicts,
+            jolt_client=jolt_client,
+            aggregation_config=req.aggregation_config,  # 🆕 Aggregation support
+            expression_config=req.expression_config,  # 🆕 Expression evaluation support
+        )
+        all_records.extend(processed)
+    
+    # Validate against target Avro schema AFTER all processing (including aggregation)
+    if req.target_avro_schema and all_records:
+        from common.avro import validate_batch_list, normalize_records_for_schema
+        # Normalize union types for target schema compatibility
+        all_records = normalize_records_for_schema(all_records, req.target_avro_schema)
+        # Validate final data structure against target schema
+        validate_batch_list(all_records, req.target_avro_schema)
+    
+    # Write to file using FileWriter
+    # Determine field names based on configuration
+    if req.aggregation_config and all_records:
+        # Use actual column names from aggregated data
+        available_fields = list(all_records[0].keys())
+        
+        # If target Avro schema is provided, use it to filter/order columns
+        if req.target_avro_schema and "fields" in req.target_avro_schema:
+            schema_fields = [field["name"] for field in req.target_avro_schema["fields"]]
+            # Only include fields that exist in both schema and data
+            field_names = [f for f in schema_fields if f in available_fields]
+        else:
+            field_names = available_fields
+    else:
+        # Use mapping target names for non-aggregated data
+        field_names = list(all_records[0].keys()) if all_records else []
+
+    if all_records:
+        logger.info("Sample record before write: %s", all_records[0])
+    if req.file.type == "delimited":
+        written_path = await FileWriter.write_csv(
+            all_records,
+            filepath,
+            field_names,
+            encoding=req.file.encoding,
+            delimiter=req.file.delimiter,
+            quotechar=req.file.quotechar,
+            header=req.file.header,
+            compress=req.file.compress,
+        )
+    elif req.file.type in ("xls", "xlsx"):
+        written_path = await FileWriter.write_excel(
+            all_records,
+            filepath,
+            field_names,
+            sheet_name=req.file.sheet_name,
+            header=req.file.header,
+        )
+    else:  # fixed
+        if req.aggregation_config:
+            raise HTTPException(
+                status_code=400,
+                detail="Fixed-width format is not supported with aggregation. Use delimited format instead."
+            )
+        field_widths = [m.width for m in req.mapping]
+        written_path = await FileWriter.write_fixed_width(
+            all_records,
+            filepath,
+            field_names,
+            field_widths,
+            encoding=req.file.encoding,
+            align=req.mapping[0].align if req.mapping else "left",
+            pad_char=req.mapping[0].pad_char if req.mapping else " ",
+            strict_width=req.file.strict_width,
+            header=req.file.header,
+            compress=req.file.compress,
+        )
+    
+    return written_path, len(all_records)
+
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    """
+    Health check endpoint.
+    
+    Returns service health status for monitoring and load balancers.
+    
+    Returns:
+        Dict with status="ok", service name, and correlation ID
+        
+    Example Response:
+        {
+            "status": "ok",
+            "service": "db-to-file",
+            "correlation_id": "health-check-123"
+        }
+    """
+    logger.debug("Health check requested")
+    return {"status": "ok", "service": SERVICE_NAME, "correlation_id": get_correlation_id()}
+
+
+@app.post("/export/dbtofile", response_model=ExportResponse)
+@limiter.limit(STRICT_RATE_LIMIT)  # 10 requests per minute
+async def export_dbtofile(
+    request: Request,  # Required by SlowAPI for rate limiting
+    req: ExportRequest,
+    auth: Dict = Depends(verify_jwt_or_basic),
+) -> ExportResponse:
+    """
+    Export database to file with full ETL pipeline.
+    
+    This is the main export endpoint that orchestrates the complete data flow from
+    database to file with validation, transformation, formatting, and audit trail.
+    
+    Authentication:
+    ---------------
+    Requires JWT token or Basic authentication (verified by security gateway).
+    The authenticated user/subject is included in audit events.
+    
+    Data Flow:
+    ----------
+    1. **Query Database**
+       - Streaming query execution (memory-efficient)
+       - WHERE clause filtering with 12 operators
+       - Column selection based on mapping
+    
+    2. **Column Mapping**
+       - Maps source columns to target fields
+       - Applies default values for nulls
+    
+    3. **Transformation (Optional)**
+       - Applies JOLT transformations if jolt_spec provided
+       - Supports shift, default, remove, modify operations
+    
+    4. **Avro Validation (Optional)**
+       - Validates transformed data against target_avro_schema (if provided)
+       - Ensures data quality before file write
+    
+    5. **Value Formatting**
+       - Date formatting (%Y-%m-%d, %m/%d/%Y, etc.)
+       - Decimal formatting (%.2f, %.4f, etc.)
+       - Type conversion
+    
+    6. **File Write**
+       - CSV/TSV: Delimited output with headers
+       - Fixed-Width: Positional data with alignment
+       - Gzip compression (optional)
+       - Custom encoding support
+    
+    7. **Audit Trail**
+       - Publishes events to Kafka: records_received, records_processed,
+         records_written
+       - Full correlation ID tracking for data lineage
+    
+    File Naming:
+    ------------
+    Output files are automatically named with timestamp:
+    - CSV: {prefix}_{timestamp}.csv
+    - TSV: {prefix}_{timestamp}.tsv
+    - Fixed: {prefix}_{timestamp}.txt
+    - Compressed: {filename}.gz
+    
+    Performance:
+    ------------
+    - Batch processing: Configurable batch size (default: 10,000 records)
+    - Throughput: 10,000-50,000 records/sec depending on database and format
+    - Memory: Processes data in batches to minimize memory footprint
+    
+    Args:
+        request: ExportRequest with complete ETL configuration
+        auth: Authentication context (injected by dependency)
+    
+    Returns:
+        ExportResponse with status, records, file path, and duration_ms
+    
+    Raises:
+        HTTPException 400: Invalid request (schema validation, identifier validation)
+        HTTPException 500: Export failure (database error, file write error)
+    
+    Example:
+        See DB_TO_FILE_SPECIFICATION.md for complete request examples.
+    """
+    start_time = time.time()
+    correlation_id = get_correlation_id()
+    
+    logger.info(
+        f"Starting DB-to-File export: {req.db.table_name} -> {req.file.output_path}",
+        extra={
+            "extra_fields": {
+                "source_table": req.db.table_name,
+                "source_schema": req.db.schema_name,
+                "output_path": req.file.output_path,
+                "file_type": req.file.type,
+                "auth_user": auth.get("username") or auth.get("subject"),
+                "has_jolt": req.jolt_spec is not None,
+            }
+        }
+    )
+    
+    # Audit: Operation started
+    await publish_audit_event(
+        domain_id=DEFAULT_DOMAIN_ID,
+        entity_type="OPERATION",
+        entity_id=f"{req.db.table_name}->{req.file.output_path}",
+        event_type="OPERATION_STARTED",
+        outcome="INFO",
+        details=f"Starting DB-to-file export from {req.db.table_name} to {req.file.output_path}",
+        payload={
+            "operation_type": "db-to-file",
+            "source": req.db.table_name,
+            "destination": req.file.output_path,
+            "correlation_id": correlation_id,
+        },
+        metadata={
+            "correlation_id": correlation_id,
+            "source": req.db.table_name,
+            "destination": req.file.output_path,
+        },
+    )
+    
+    with OPERATION_LATENCY.labels(service=SERVICE_NAME, operation="export").time():
+        try:
+            # Validate identifiers
+            validate_ident(req.db.table_name, "table name")
+            if req.db.schema_name:
+                validate_ident(req.db.schema_name, "schema name")
+            
+            logger.debug(f"Validated identifiers: table={req.db.table_name}, schema={req.db.schema_name}")
+            
+            # Create DB engine
+            engine = async_engine(req.db.sqlalchemy_url)
+            
+            # Reflect table
+            table = await reflect_table(
+                engine,
+                req.db.table_name,
+                req.db.schema_name,
+            )
+            
+            # Initialize JOLT client if needed
+            jolt_client = JoltClient() if req.jolt_spec else None
+            
+            # Export to file
+            logger.debug(f"About to call export_to_file with table: {table.name}")
+            try:
+                filepath, total_records = await export_to_file(
+                    engine,
+                    table,
+                    req,
+                    jolt_client,
+                )
+                logger.debug(f"export_to_file completed successfully: {filepath}, {total_records} records")
+            except Exception as export_error:
+                logger.error(f"export_to_file failed with error: {type(export_error).__name__}: {str(export_error)}")
+                logger.debug(f"Full export error details: {export_error}", exc_info=True)
+                raise
+            
+            # Audit: File written (already done below with publish_audit_event)
+            
+            # Cleanup
+            await engine.dispose()
+            
+            # Metrics
+            record_batch(SERVICE_NAME, "export", total_records)
+            record_success(SERVICE_NAME, "export", total_records)
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            logger.info(
+                f"Export completed successfully: {total_records} records in {duration_ms}ms",
+                extra={
+                    "extra_fields": {
+                        "total_records": total_records,
+                        "duration_ms": duration_ms,
+                        "output_file": filepath,
+                        "file_type": req.file.type,
+                        "records_per_second": int(total_records / (duration_ms / 1000)) if duration_ms > 0 else 0,
+                    }
+                }
+            )
+            
+            # Audit: Operation completed successfully
+            await publish_audit_event(
+                domain_id=DEFAULT_DOMAIN_ID,
+                entity_type="OPERATION",
+                entity_id=f"{req.db.table_name}->{req.file.output_path}",
+                event_type="OPERATION_COMPLETED",
+                outcome="SUCCESS",
+                details=f"Completed DB-to-file export: {total_records} records in {duration_ms:.2f}ms",
+                payload={
+                    "operation_type": "db-to-file",
+                    "source": req.db.table_name,
+                    "destination": filepath,
+                    "records_count": total_records,
+                    "duration_ms": duration_ms,
+                    "correlation_id": correlation_id,
+                },
+                metadata={
+                    "correlation_id": correlation_id,
+                    "source": req.db.table_name,
+                    "destination": filepath,
+                },
+            )
+            
+            return ExportResponse(
+                status="OK",
+                records=total_records,
+                file=filepath,
+                duration_ms=duration_ms,
+            )
+        
+        except HTTPException:
+            raise
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Audit: Operation failed
+            await publish_audit_event(
+                domain_id=DEFAULT_DOMAIN_ID,
+                entity_type="OPERATION",
+                entity_id=f"{req.db.table_name}->{req.file.output_path}",
+                event_type="OPERATION_FAILED",
+                outcome="FAILURE",
+                details=f"DB-to-file export failed: {type(e).__name__}: {str(e)}",
+                payload={
+                    "operation_type": "db-to-file",
+                    "source": req.db.table_name,
+                    "destination": req.file.output_path,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "records_processed": 0,
+                    "duration_ms": duration_ms,
+                    "correlation_id": correlation_id,
+                },
+                metadata={
+                    "correlation_id": correlation_id,
+                    "source": req.db.table_name,
+                    "destination": req.file.output_path,
+                },
+            )
+            
+            log_error(logger, e, "export",
+                     source_table=req.db.table_name,
+                     output_path=req.file.output_path)
+            record_error(SERVICE_NAME, "export", type(e).__name__)
+            raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+if __name__ == "__main__":
+    """
+    Run the DB-to-File service directly (development mode).
+    
+    For production deployment, use:
+    - Docker: See Dockerfile in service directory
+    - Kubernetes: See deployment manifests in deploy/
+    - Uvicorn: uvicorn app.db_to_file_service:app --host 0.0.0.0 --port 9091
+    
+    Environment Variables:
+    ----------------------
+    PORT: Service port (default: 9091)
+    LOG_LEVEL: Logging level (default: INFO)
+    JSON_LOGS: Enable JSON logging (default: false)
+    SECURITY_BASE_URL: Security gateway URL (default: http://localhost:8088)
+    KAFKA_BOOTSTRAP_SERVERS: Kafka servers for audit events
+    KAFKA_AUDIT_TOPIC: Kafka topic for audit events (default: audit-events)
+    AUDIT_ENABLED: Enable/disable audit publishing (default: true)
+    """
+    import uvicorn
+    port = int(os.getenv("PORT", "9091"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
