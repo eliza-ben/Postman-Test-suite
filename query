@@ -57,3 +57,15 @@ account_description not in ('RELATIONSHIP SUMMARY')  ORDER BY id LIMIT 1
 
 Select DISTINCT invoice_dt,TO_CHAR(TO_DATE(from_dt, 'YYYYMMDD'), 'Mon YYYY') as invoice  from centrl.invoice_fee_stg where correlation_id='02100002_202601_02-09-26_134349_SXV84' 
 and account_description not in ('RELATIONSHIP SUMMARY') 
+
+
+
+SELECT 
+    SUM(charge_amount::numeric) AS invoice_charge,
+    MIN(currency) AS currency,
+    MIN(invoice_dt) AS invoice_dt,
+    TO_CHAR(TO_DATE(MIN(from_dt), 'YYYYMMDD'), 'Mon YYYY') AS invoice
+FROM centrl.invoice_fee_stg
+WHERE correlation_id = '02100002_202601_02-09-26_134349_SXV84'
+    AND account_description NOT IN ('RELATIONSHIP SUMMARY');
+
