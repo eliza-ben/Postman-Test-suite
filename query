@@ -69,3 +69,40 @@ FROM centrl.invoice_fee_stg
 WHERE correlation_id = '02100002_202601_02-09-26_134349_SXV84'
     AND account_description NOT IN ('RELATIONSHIP SUMMARY');
 
+
+
+view 
+CREATE OR REPLACE VIEW centrl.invoice_charge_summary_v AS
+SELECT 
+    correlation_id,
+    SUM(charge_amount::numeric) AS invoice_charge,
+    MIN(currency) AS currency,
+    MIN(invoice_dt) AS invoice_dt,
+    TO_CHAR(TO_DATE(MIN(from_dt), 'YYYYMMDD'), 'Mon YYYY') AS invoice
+FROM centrl.invoice_fee_stg
+WHERE account_description NOT IN ('RELATIONSHIP SUMMARY')
+GROUP BY correlation_id;
+
+
+
+
+CREATE OR REPLACE VIEW centrl.invoice_account_summary_v AS
+SELECT DISTINCT 
+    a.correlation_id,
+    a.account_id,
+    a.currency,
+    'US' AS country,
+    b.account_charge
+FROM centrl.invoice_fee_stg a
+JOIN (
+    SELECT 
+        correlation_id,
+        account_id,
+        SUM(charge_amount::numeric) AS account_charge
+    FROM centrl.invoice_fee_stg
+    WHERE account_description NOT IN ('RELATIONSHIP SUMMARY')
+    GROUP BY correlation_id, account_id
+) b ON a.account_id = b.account_id 
+    AND a.correlation_id = b.correlation_id
+WHERE a.account_description NOT IN ('RELATIONSHIP SUMMARY');
+
