@@ -1,0 +1,2397 @@
+"""
+Expression Evaluation Engine for ETL Pipelines
+
+This module provides a safe, extensible expression evaluation engine that allows
+dynamic column value calculations based on source data. It's designed to work
+with React Expression Builder output format and supports a wide variety of operations.
+
+Key Features:
+-------------
+1. Safe Expression Evaluation:
+   - No arbitrary code execution
+   - Whitelist-based function support
+   - Sandboxed evaluation environment
+
+2. Source Column References:
+   - Reference source columns using ${column_name} syntax
+   - Support for nested field access: ${parent.child}
+   - Null-safe navigation
+
+3. Supported Operations:
+   - Arithmetic: +, -, *, /, %, **
+   - Comparison: ==, !=, <, >, <=, >=
+   - Logical: and, or, not
+   - String: concat, upper, lower, trim, substring, replace, split, join
+   - Numeric: round, floor, ceil, abs, min, max
+   - Date: now, date_format, date_parse, date_add, date_diff
+   - Conditional: if, coalesce, nullif, case
+   - Type conversion: int, float, str, bool, decimal
+
+4. Default Values:
+   - Specify fallback values when expression evaluates to null
+   - Support for complex default expressions
+
+Usage:
+------
+    from common.expression_evaluator import ExpressionEvaluator, ExpressionConfig
+    
+    config = ExpressionConfig(
+        expressions=[
+            {
+                "target_column": "full_name",
+                "expression": "concat(${first_name}, ' ', ${last_name})",
+                "default": "Unknown"
+            },
+            {
+                "target_column": "total_amount",
+                "expression": "${quantity} * ${unit_price}",
+                "default": 0
+            }
+        ]
+    )
+    
+    evaluator = ExpressionEvaluator()
+    result = evaluator.evaluate_record(record, config)
+"""
+
+import re
+import math
+import operator
+import logging
+from typing import Any, Dict, List, Optional, Union, Callable
+from pydantic import BaseModel, Field
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, date, timedelta, time
+from dateutil import parser as date_parser
+from dateutil.relativedelta import relativedelta
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# PYDANTIC MODELS
+# =============================================================================
+
+class ColumnExpression(BaseModel):
+    """
+    Configuration for a single column expression.
+    
+    Defines how to compute the value for a target column using an expression
+    that can reference source columns and apply various operations.
+    
+    Examples:
+    ---------
+    Simple column reference:
+        {
+            "target_column": "name",
+            "expression": "${source_name}",
+            "default": "N/A"
+        }
+    
+    Arithmetic calculation:
+        {
+            "target_column": "total",
+            "expression": "${quantity} * ${price}",
+            "default": 0
+        }
+    
+    String concatenation:
+        {
+            "target_column": "full_name",
+            "expression": "concat(${first_name}, ' ', ${last_name})",
+            "default": "Unknown"
+        }
+    
+    Conditional expression:
+        {
+            "target_column": "status",
+            "expression": "if(${amount} > 1000, 'Premium', 'Standard')",
+            "default": "Unknown"
+        }
+    """
+    target_column: str = Field(..., description="Target column name in the output")
+    expression: str = Field(..., description="Expression to evaluate. Use ${column_name} or bare variable names (expr-eval syntax)")
+    default: Optional[Any] = Field(default=None, description="Default value if expression evaluates to null or fails")
+    data_type: Optional[str] = Field(default=None, description="Expected data type: string, int, float, decimal, boolean, date, datetime")
+    syntax: Optional[str] = Field(default="auto", description="Expression syntax: 'template' (${col}), 'expr-eval' (bare names), or 'auto' (detect)")
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "target_column": "total_amount",
+                "expression": "${quantity} * ${unit_price}",
+                "default": 0,
+                "data_type": "decimal"
+            }
+        }
+
+
+class ExpressionConfig(BaseModel):
+    """
+    Complete expression evaluation configuration.
+    
+    Defines all column expressions to apply during ETL processing.
+    This configuration can be used across all ETL services for consistent
+    expression evaluation behavior.
+    
+    Examples:
+    ---------
+    Basic expressions:
+        {
+            "expressions": [
+                {"target_column": "id", "expression": "${source_id}"},
+                {"target_column": "name", "expression": "upper(${source_name})"},
+                {"target_column": "total", "expression": "${qty} * ${price}", "default": 0}
+            ],
+            "preserve_unmapped": false
+        }
+    
+    With pass-through of unmapped columns:
+        {
+            "expressions": [...],
+            "preserve_unmapped": true
+        }
+    """
+    expressions: List[ColumnExpression] = Field(..., description="List of column expressions to evaluate")
+    preserve_unmapped: bool = Field(default=False, description="If true, preserve source columns not in expressions")
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "expressions": [
+                    {"target_column": "full_name", "expression": "concat(${first_name}, ' ', ${last_name})", "default": "Unknown"},
+                    {"target_column": "total", "expression": "${quantity} * ${price}", "default": 0}
+                ],
+                "preserve_unmapped": False
+            }
+        }
+
+
+# =============================================================================
+# EXPRESSION EVALUATOR
+# =============================================================================
+
+class ExpressionEvaluator:
+    """
+    Safe expression evaluator for ETL column transformations.
+    
+    Provides a sandboxed environment for evaluating expressions that reference
+    source columns and apply various operations. All functions are whitelisted
+    to prevent arbitrary code execution.
+    """
+    
+    # Regex pattern to match column references: ${column_name} or ${parent.child}
+    COLUMN_REF_PATTERN = re.compile(r'\$\{([a-zA-Z_][a-zA-Z0-9_\.]*)\}')
+    
+    # Regex pattern to match expr-eval bare variable names (identifiers not inside quotes or functions)
+    # Matches word characters that are valid identifiers but excludes Python keywords and our functions
+    EXPR_EVAL_VAR_PATTERN = re.compile(r'(?<![\w$])([a-zA-Z_][a-zA-Z0-9_]*)(?![\w(])')
+    
+    # Python keywords and built-in constants to exclude from variable detection
+    RESERVED_WORDS = {
+        'and', 'or', 'not', 'in', 'is', 'True', 'False', 'None',
+        'if', 'else', 'elif', 'for', 'while', 'break', 'continue', 'return',
+        'def', 'class', 'import', 'from', 'as', 'try', 'except', 'finally',
+        'with', 'lambda', 'yield', 'global', 'nonlocal', 'assert', 'pass',
+        'del', 'raise', 'E', 'PI', 'true', 'false', 'null'
+    }
+    
+    # Safe operators for arithmetic evaluation
+    OPERATORS = {
+        '+': operator.add,
+        '-': operator.sub,
+        '*': operator.mul,
+        '/': operator.truediv,
+        '//': operator.floordiv,
+        '%': operator.mod,
+        '**': operator.pow,
+        '==': operator.eq,
+        '!=': operator.ne,
+        '<': operator.lt,
+        '>': operator.gt,
+        '<=': operator.le,
+        '>=': operator.ge,
+    }
+    
+    def __init__(self):
+        """Initialize the expression evaluator with built-in functions and caching."""
+        self.functions = self._build_function_registry()
+        # Expression template cache for performance optimization
+        self._expression_cache: Dict[str, str] = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+    
+    # expr-eval 2.0.2 operator mappings
+    EXPR_EVAL_OPERATOR_MAP = {
+        '&&': ' and ',
+        '||': ' or ',
+        '^': '**',  # exponentiation
+    }
+    
+    # expr-eval 2.0.2 function mappings to our functions
+    EXPR_EVAL_FUNCTION_MAP = {
+        # Math functions (expr-eval → our function)
+        'sin': 'sin',
+        'cos': 'cos',
+        'tan': 'tan',
+        'asin': 'asin',
+        'acos': 'acos',
+        'atan': 'atan',
+        'sinh': 'sinh',
+        'cosh': 'cosh',
+        'tanh': 'tanh',
+        'sqrt': 'sqrt',
+        'cbrt': 'cbrt',
+        'log': 'log',
+        'log2': 'log2',
+        'log10': 'log10',
+        'ln': 'log',
+        'exp': 'exp',
+        'abs': 'abs',
+        'ceil': 'ceil',
+        'floor': 'floor',
+        'round': 'round',
+        'trunc': 'trunc',
+        'sign': 'sign',
+        'min': 'min',
+        'max': 'max',
+        'pow': 'power',
+        'atan2': 'atan2',
+        'random': 'random',
+        'fac': 'factorial',
+        # String functions
+        'length': 'length',
+        'concat': 'concat',
+        # Conditional
+        'if': 'if',
+    }
+    
+    def convert_expr_eval_to_template(
+        self, 
+        expression: str, 
+        available_columns: Optional[List[str]] = None
+    ) -> str:
+        """
+        Convert expr-eval 2.0.2 syntax to template syntax.
+        
+        Handles full expr-eval syntax including:
+        - Bare variable names: `quantity * price` → `${quantity} * ${price}`
+        - Ternary operator: `a > b ? x : y` → `if(a > b, x, y)`
+        - Logical operators: `&&` → `and`, `||` → `or`, `!x` → `not x`
+        - Exponentiation: `^` → `**`
+        - All comparison operators: ==, !=, <, >, <=, >=
+        - Math functions: sin, cos, sqrt, abs, etc.
+        - String operations
+        
+        Args:
+            expression: Expression in expr-eval syntax
+            available_columns: Optional list of column names to use for variable detection.
+                             
+        Returns:
+            Expression in template syntax with ${column} references
+            
+        Examples:
+            "quantity * price"           → "${quantity} * ${price}"
+            "age > 18 ? 'adult' : 'minor'" → "if(${age} > 18, 'adult', 'minor')"
+            "a && b || !c"               → "${a} and ${b} or not ${c}"
+            "2 ^ 3"                      → "2**3"
+            "firstName || ' ' || lastName" → "concat(${firstName}, ' ', ${lastName})"
+        """
+        if not expression:
+            return expression
+        
+        # If expression already uses template syntax, return as-is
+        if '${' in expression:
+            return expression
+        
+        # Step 1: Convert ternary operators (must be done first, recursively)
+        expression = self._convert_ternary_to_if(expression)
+        
+        # Step 2: Convert logical operators
+        expression = self._convert_logical_operators(expression)
+        
+        # Step 3: Convert exponentiation ^ to **
+        expression = self._convert_exponentiation(expression)
+        
+        # Step 4: Convert string concatenation || to concat()
+        expression = self._convert_string_concat(expression)
+        
+        # Step 5: Convert bare variable names to ${column} syntax
+        expression = self._convert_variables_to_template(expression, available_columns)
+        
+        return expression
+    
+    def _convert_ternary_to_if(self, expression: str) -> str:
+        """
+        Convert ternary operator `condition ? trueVal : falseVal` to `if(condition, trueVal, falseVal)`.
+        Handles nested ternaries.
+        """
+        result = []
+        i = 0
+        in_string = False
+        string_char = None
+        paren_depth = 0
+        
+        while i < len(expression):
+            char = expression[i]
+            
+            # Track string literals
+            if char in ('"', "'") and (i == 0 or expression[i-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+                result.append(char)
+                i += 1
+                continue
+            
+            if in_string:
+                result.append(char)
+                i += 1
+                continue
+            
+            # Track parentheses
+            if char == '(':
+                paren_depth += 1
+            elif char == ')':
+                paren_depth -= 1
+            
+            # Found ternary operator ?
+            if char == '?' and paren_depth == 0:
+                # Find the matching : for this ?
+                colon_pos = self._find_matching_colon(expression, i + 1)
+                if colon_pos != -1:
+                    # Extract condition (everything before ?)
+                    condition = ''.join(result).strip()
+                    result = []
+                    
+                    # Extract true value (between ? and :)
+                    true_val = expression[i + 1:colon_pos].strip()
+                    
+                    # Extract false value (after :)
+                    # Find end - either end of string or next operator at same level
+                    false_end = len(expression)
+                    false_val = expression[colon_pos + 1:false_end].strip()
+                    
+                    # Recursively convert nested ternaries
+                    true_val = self._convert_ternary_to_if(true_val)
+                    false_val = self._convert_ternary_to_if(false_val)
+                    condition = self._convert_ternary_to_if(condition)
+                    
+                    result.append(f'if({condition}, {true_val}, {false_val})')
+                    i = false_end
+                    continue
+            
+            result.append(char)
+            i += 1
+        
+        return ''.join(result)
+    
+    def _find_matching_colon(self, expression: str, start: int) -> int:
+        """Find the matching : for a ternary operator, respecting nesting."""
+        depth = 0
+        in_string = False
+        string_char = None
+        
+        for i in range(start, len(expression)):
+            char = expression[i]
+            
+            # Track strings
+            if char in ('"', "'") and (i == 0 or expression[i-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+            
+            if in_string:
+                continue
+            
+            if char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+            elif char == '?':
+                depth += 1  # Nested ternary
+            elif char == ':' and depth == 0:
+                return i
+            elif char == ':' and depth > 0:
+                depth -= 1  # End of nested ternary
+        
+        return -1
+    
+    def _convert_logical_operators(self, expression: str) -> str:
+        """Convert && to 'and', || to 'or', !x to 'not x'."""
+        result = []
+        i = 0
+        in_string = False
+        string_char = None
+        
+        while i < len(expression):
+            char = expression[i]
+            
+            # Track string literals
+            if char in ('"', "'") and (i == 0 or expression[i-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+                result.append(char)
+                i += 1
+                continue
+            
+            if in_string:
+                result.append(char)
+                i += 1
+                continue
+            
+            # Check for &&
+            if char == '&' and i + 1 < len(expression) and expression[i + 1] == '&':
+                result.append(' and ')
+                i += 2
+                continue
+            
+            # Check for || (logical or, not string concat - handle separately)
+            if char == '|' and i + 1 < len(expression) and expression[i + 1] == '|':
+                # This might be string concat or logical OR - we'll handle in separate pass
+                result.append('||')
+                i += 2
+                continue
+            
+            # Check for ! (not operator) - but not !=
+            if char == '!' and i + 1 < len(expression) and expression[i + 1] != '=':
+                result.append('not ')
+                i += 1
+                continue
+            
+            result.append(char)
+            i += 1
+        
+        return ''.join(result)
+    
+    def _convert_exponentiation(self, expression: str) -> str:
+        """Convert ^ to ** for exponentiation."""
+        result = []
+        i = 0
+        in_string = False
+        string_char = None
+        
+        while i < len(expression):
+            char = expression[i]
+            
+            if char in ('"', "'") and (i == 0 or expression[i-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+                result.append(char)
+                i += 1
+                continue
+            
+            if in_string:
+                result.append(char)
+                i += 1
+                continue
+            
+            if char == '^':
+                result.append('**')
+                i += 1
+                continue
+            
+            result.append(char)
+            i += 1
+        
+        return ''.join(result)
+    
+    def _convert_string_concat(self, expression: str) -> str:
+        """
+        Convert || used for string concatenation to concat().
+        This is tricky because || could also be logical OR.
+        We convert || to concat() when operands appear to be strings.
+        """
+        # For now, convert remaining || to 'or' (logical)
+        # String concat should use concat() function directly
+        result = []
+        i = 0
+        in_string = False
+        string_char = None
+        
+        while i < len(expression):
+            char = expression[i]
+            
+            if char in ('"', "'") and (i == 0 or expression[i-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+                result.append(char)
+                i += 1
+                continue
+            
+            if in_string:
+                result.append(char)
+                i += 1
+                continue
+            
+            # Convert || to 'or'
+            if char == '|' and i + 1 < len(expression) and expression[i + 1] == '|':
+                result.append(' or ')
+                i += 2
+                continue
+            
+            result.append(char)
+            i += 1
+        
+        return ''.join(result)
+    
+    def _convert_variables_to_template(
+        self, 
+        expression: str, 
+        available_columns: Optional[List[str]] = None
+    ) -> str:
+        """Convert bare variable names to ${column} syntax."""
+        if not expression:
+            return expression
+        
+        # Build set of function names to exclude
+        function_names = set(self.functions.keys())
+        exclude_set = self.RESERVED_WORDS | function_names
+        
+        # Add expr-eval function names
+        exclude_set.update(self.EXPR_EVAL_FUNCTION_MAP.keys())
+        
+        column_set = set(available_columns) if available_columns else None
+        
+        result = []
+        i = 0
+        in_string = False
+        string_char = None
+        
+        while i < len(expression):
+            char = expression[i]
+            
+            # Handle string literals
+            if char in ('"', "'") and (i == 0 or expression[i-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+                result.append(char)
+                i += 1
+                continue
+            
+            if in_string:
+                result.append(char)
+                i += 1
+                continue
+            
+            # Check for identifier
+            if char.isalpha() or char == '_':
+                # Extract full identifier
+                j = i
+                while j < len(expression) and (expression[j].isalnum() or expression[j] == '_'):
+                    j += 1
+                identifier = expression[i:j]
+                
+                # Check if it's followed by ( - means it's a function call
+                next_non_space = j
+                while next_non_space < len(expression) and expression[next_non_space] == ' ':
+                    next_non_space += 1
+                is_function_call = next_non_space < len(expression) and expression[next_non_space] == '('
+                
+                # Convert if it's a column reference (not a function or reserved word)
+                if not is_function_call and identifier not in exclude_set:
+                    if column_set is None or identifier in column_set:
+                        result.append(f'${{{identifier}}}')
+                    else:
+                        result.append(identifier)
+                else:
+                    result.append(identifier)
+                i = j
+            else:
+                result.append(char)
+                i += 1
+        
+        return ''.join(result)
+    
+    def detect_syntax(self, expression: str) -> str:
+        """
+        Detect whether expression uses template or expr-eval syntax.
+        
+        Returns:
+            'template' if expression uses ${column} syntax
+            'expr-eval' if expression uses bare variable names
+        """
+        if '${' in expression:
+            return 'template'
+        return 'expr-eval'
+    
+    def normalize_expression(
+        self, 
+        expression: str, 
+        syntax: str = 'auto',
+        available_columns: Optional[List[str]] = None
+    ) -> str:
+        """
+        Normalize expression to template syntax.
+        
+        Args:
+            expression: Expression string
+            syntax: 'template', 'expr-eval', or 'auto'
+            available_columns: Column names for expr-eval conversion
+            
+        Returns:
+            Expression in template syntax
+        """
+        if syntax == 'auto':
+            syntax = self.detect_syntax(expression)
+        
+        if syntax == 'expr-eval':
+            return self.convert_expr_eval_to_template(expression, available_columns)
+        
+        return expression
+    
+    def _build_function_registry(self) -> Dict[str, Callable]:
+        """Build the registry of safe functions available in expressions."""
+        return {
+            # String functions (comprehensive for expr-eval custom function compatibility)
+            'concat': self._fn_concat,
+            'upper': lambda s: str(s).upper() if s is not None else None,
+            'lower': lambda s: str(s).lower() if s is not None else None,
+            'capitalize': lambda s: str(s).capitalize() if s is not None else None,
+            'title': lambda s: str(s).title() if s is not None else None,
+            'trim': lambda s: str(s).strip() if s is not None else None,
+            'ltrim': lambda s: str(s).lstrip() if s is not None else None,
+            'rtrim': lambda s: str(s).rstrip() if s is not None else None,
+            'strip': lambda s: str(s).strip() if s is not None else None,  # alias
+            'substring': self._fn_substring,
+            'substr': self._fn_substring,  # alias
+            'slice': self._fn_substring,  # JS-style alias
+            'replace': lambda s, old, new: str(s).replace(old, new) if s is not None else None,
+            'replaceAll': lambda s, old, new: str(s).replace(old, new) if s is not None else None,  # JS alias
+            'split': lambda s, sep=',': str(s).split(sep) if s is not None else None,
+            'join': lambda lst, sep=',': sep.join(str(x) for x in lst) if lst is not None else None,
+            'length': lambda s: len(str(s)) if s is not None else None,
+            'len': lambda s: len(str(s)) if s is not None else None,  # alias
+            'left': lambda s, n: str(s)[:int(n)] if s is not None else None,
+            'right': lambda s, n: str(s)[-int(n):] if s is not None else None,
+            'mid': lambda s, start, length: str(s)[int(start):int(start)+int(length)] if s is not None else None,
+            'pad_left': lambda s, n, c=' ': str(s).rjust(int(n), str(c)[0]) if s is not None else None,
+            'pad_right': lambda s, n, c=' ': str(s).ljust(int(n), str(c)[0]) if s is not None else None,
+            'padStart': lambda s, n, c=' ': str(s).rjust(int(n), str(c)[0]) if s is not None else None,  # JS alias
+            'padEnd': lambda s, n, c=' ': str(s).ljust(int(n), str(c)[0]) if s is not None else None,  # JS alias
+            'repeat': lambda s, n: str(s) * int(n) if s is not None else None,
+            'reverse': lambda s: str(s)[::-1] if s is not None else None,
+            'contains': lambda s, sub: sub in str(s) if s is not None and sub is not None else False,
+            'includes': lambda s, sub: sub in str(s) if s is not None and sub is not None else False,  # JS alias
+            'starts_with': lambda s, prefix: str(s).startswith(prefix) if s is not None else False,
+            'startsWith': lambda s, prefix: str(s).startswith(prefix) if s is not None else False,  # JS alias
+            'ends_with': lambda s, suffix: str(s).endswith(suffix) if s is not None else False,
+            'endsWith': lambda s, suffix: str(s).endswith(suffix) if s is not None else False,  # JS alias
+            'indexOf': lambda s, sub: str(s).find(sub) if s is not None and sub is not None else -1,
+            'lastIndexOf': lambda s, sub: str(s).rfind(sub) if s is not None and sub is not None else -1,
+            'charAt': lambda s, i: str(s)[int(i)] if s is not None and 0 <= int(i) < len(str(s)) else '',
+            'charCodeAt': lambda s, i: ord(str(s)[int(i)]) if s is not None and 0 <= int(i) < len(str(s)) else None,
+            'fromCharCode': lambda *codes: ''.join(chr(int(c)) for c in codes),
+            'match': self._fn_regex_match,
+            'test': lambda s, pattern: bool(re.search(pattern, str(s))) if s is not None else False,
+            'regex_match': self._fn_regex_match,
+            'regex_replace': self._fn_regex_replace,
+            'format': self._fn_format,
+            'sprintf': self._fn_format,  # alias
+            'isNumeric': lambda s: str(s).replace('.', '', 1).replace('-', '', 1).isdigit() if s is not None else False,
+            'isAlpha': lambda s: str(s).isalpha() if s is not None else False,
+            'isAlphaNumeric': lambda s: str(s).isalnum() if s is not None else False,
+            'isEmpty': lambda s: s is None or str(s).strip() == '',
+            'isNotEmpty': lambda s: s is not None and str(s).strip() != '',
+            'isBlank': lambda s: s is None or str(s).strip() == '',
+            'isNotBlank': lambda s: s is not None and str(s).strip() != '',
+            'defaultIfEmpty': lambda s, default: default if s is None or str(s).strip() == '' else s,
+            'defaultIfNull': lambda s, default: default if s is None else s,
+            
+            # Numeric functions
+            'round': lambda x, n=0: round(float(x), int(n)) if x is not None else None,
+            'floor': lambda x: math.floor(float(x)) if x is not None else None,
+            'ceil': lambda x: math.ceil(float(x)) if x is not None else None,
+            'ceiling': lambda x: math.ceil(float(x)) if x is not None else None,  # alias
+            'abs': lambda x: abs(float(x)) if x is not None else None,
+            'min': lambda *args: min(x for x in args if x is not None) if any(x is not None for x in args) else None,
+            'max': lambda *args: max(x for x in args if x is not None) if any(x is not None for x in args) else None,
+            'sum': lambda *args: sum(float(x) for x in args if x is not None),
+            'avg': self._fn_avg,
+            'power': lambda x, y: math.pow(float(x), float(y)) if x is not None and y is not None else None,
+            'pow': lambda x, y: math.pow(float(x), float(y)) if x is not None and y is not None else None,  # expr-eval alias
+            'sqrt': lambda x: math.sqrt(float(x)) if x is not None and float(x) >= 0 else None,
+            'cbrt': lambda x: math.copysign(abs(float(x)) ** (1/3), float(x)) if x is not None else None,  # cube root
+            'log': lambda x, base=math.e: math.log(float(x), base) if x is not None and float(x) > 0 else None,
+            'ln': lambda x: math.log(float(x)) if x is not None and float(x) > 0 else None,  # natural log alias
+            'log10': lambda x: math.log10(float(x)) if x is not None and float(x) > 0 else None,
+            'log2': lambda x: math.log2(float(x)) if x is not None and float(x) > 0 else None,
+            'exp': lambda x: math.exp(float(x)) if x is not None else None,
+            'trunc': lambda x: math.trunc(float(x)) if x is not None else None,
+            'sign': lambda x: (1 if float(x) > 0 else (-1 if float(x) < 0 else 0)) if x is not None else None,
+            'random': lambda: __import__('random').random(),
+            'factorial': lambda x: math.factorial(int(x)) if x is not None and int(x) >= 0 else None,
+            'fac': lambda x: math.factorial(int(x)) if x is not None and int(x) >= 0 else None,  # expr-eval alias
+            
+            # Trigonometric functions (expr-eval 2.0.2 compatibility)
+            'sin': lambda x: math.sin(float(x)) if x is not None else None,
+            'cos': lambda x: math.cos(float(x)) if x is not None else None,
+            'tan': lambda x: math.tan(float(x)) if x is not None else None,
+            'asin': lambda x: math.asin(float(x)) if x is not None and -1 <= float(x) <= 1 else None,
+            'acos': lambda x: math.acos(float(x)) if x is not None and -1 <= float(x) <= 1 else None,
+            'atan': lambda x: math.atan(float(x)) if x is not None else None,
+            'atan2': lambda y, x: math.atan2(float(y), float(x)) if y is not None and x is not None else None,
+            'sinh': lambda x: math.sinh(float(x)) if x is not None else None,
+            'cosh': lambda x: math.cosh(float(x)) if x is not None else None,
+            'tanh': lambda x: math.tanh(float(x)) if x is not None else None,
+            'asinh': lambda x: math.asinh(float(x)) if x is not None else None,
+            'acosh': lambda x: math.acosh(float(x)) if x is not None and float(x) >= 1 else None,
+            'atanh': lambda x: math.atanh(float(x)) if x is not None and -1 < float(x) < 1 else None,
+            
+            # Type conversion functions
+            'int': self._fn_int,
+            'float': self._fn_float,
+            'str': lambda x: str(x) if x is not None else None,
+            'string': lambda x: str(x) if x is not None else None,  # alias
+            'bool': self._fn_bool,
+            'boolean': self._fn_bool,  # alias
+            'decimal': self._fn_decimal,
+            
+            # Date/time functions (comprehensive for expr-eval custom function compatibility)
+            'now': lambda: datetime.now(),
+            'today': lambda: date.today(),
+            'currentDate': lambda: date.today(),  # JS-style alias
+            'currentTime': lambda: datetime.now().time(),
+            'currentDateTime': lambda: datetime.now(),
+            'date': self._fn_date,
+            'datetime': self._fn_datetime,
+            'time': self._fn_time,
+            'time_parse': self._fn_time_parse,
+            'date_format': self._fn_date_format,
+            'formatDate': self._fn_date_format,  # JS-style alias
+            'date_parse': self._fn_date_parse,
+            'parseDate': self._fn_date_parse,  # JS-style alias
+            'date_add': self._fn_date_add,
+            'addDays': lambda d, n: self._fn_date_add(d, int(n), 'days'),
+            'addMonths': lambda d, n: self._fn_date_add(d, int(n), 'months'),
+            'addYears': lambda d, n: self._fn_date_add(d, int(n), 'years'),
+            'addHours': lambda d, n: self._fn_date_add(d, int(n), 'hours'),
+            'addMinutes': lambda d, n: self._fn_date_add(d, int(n), 'minutes'),
+            'addSeconds': lambda d, n: self._fn_date_add(d, int(n), 'seconds'),
+            'subtractDays': lambda d, n: self._fn_date_add(d, -int(n), 'days'),
+            'subtractMonths': lambda d, n: self._fn_date_add(d, -int(n), 'months'),
+            'subtractYears': lambda d, n: self._fn_date_add(d, -int(n), 'years'),
+            'date_diff': self._fn_date_diff,
+            'diffDays': lambda d1, d2: self._fn_date_diff(d1, d2, 'days'),
+            'diffMonths': lambda d1, d2: self._fn_date_diff(d1, d2, 'months'),
+            'diffYears': lambda d1, d2: self._fn_date_diff(d1, d2, 'years'),
+            'diffHours': lambda d1, d2: self._fn_date_diff(d1, d2, 'hours'),
+            'diffMinutes': lambda d1, d2: self._fn_date_diff(d1, d2, 'minutes'),
+            'diffSeconds': lambda d1, d2: self._fn_date_diff(d1, d2, 'seconds'),
+            'year': lambda d: self._fn_date_part(d, 'year'),
+            'getYear': lambda d: self._fn_date_part(d, 'year'),  # JS-style alias
+            'getFullYear': lambda d: self._fn_date_part(d, 'year'),  # JS-style alias
+            'month': lambda d: self._fn_date_part(d, 'month'),
+            'getMonth': lambda d: self._fn_date_part(d, 'month'),  # JS-style alias
+            'day': lambda d: self._fn_date_part(d, 'day'),
+            'getDate': lambda d: self._fn_date_part(d, 'day'),  # JS-style alias
+            'getDay': lambda d: self._fn_date_part(d, 'weekday'),  # JS-style (day of week)
+            'hour': lambda d: self._fn_date_part(d, 'hour'),
+            'getHours': lambda d: self._fn_date_part(d, 'hour'),  # JS-style alias
+            'minute': lambda d: self._fn_date_part(d, 'minute'),
+            'getMinutes': lambda d: self._fn_date_part(d, 'minute'),  # JS-style alias
+            'second': lambda d: self._fn_date_part(d, 'second'),
+            'getSeconds': lambda d: self._fn_date_part(d, 'second'),  # JS-style alias
+            'millisecond': lambda d: self._fn_date_part(d, 'millisecond'),
+            'getMilliseconds': lambda d: self._fn_date_part(d, 'millisecond'),  # JS-style alias
+            'dayofweek': lambda d: self._fn_date_part(d, 'weekday'),
+            'weekday': lambda d: self._fn_date_part(d, 'weekday'),
+            'dayofyear': lambda d: self._fn_date_part(d, 'dayofyear'),
+            'weekofyear': lambda d: self._fn_date_part(d, 'week'),
+            'quarter': lambda d: self._fn_date_part(d, 'quarter'),
+            'isLeapYear': self._fn_is_leap_year,
+            'daysInMonth': self._fn_days_in_month,
+            'startOfDay': lambda d: self._fn_start_of(d, 'day'),
+            'startOfMonth': lambda d: self._fn_start_of(d, 'month'),
+            'startOfYear': lambda d: self._fn_start_of(d, 'year'),
+            'endOfDay': lambda d: self._fn_end_of(d, 'day'),
+            'endOfMonth': lambda d: self._fn_end_of(d, 'month'),
+            'endOfYear': lambda d: self._fn_end_of(d, 'year'),
+            'isBefore': lambda d1, d2: self._fn_compare_dates(d1, d2) < 0,
+            'isAfter': lambda d1, d2: self._fn_compare_dates(d1, d2) > 0,
+            'isSameDay': lambda d1, d2: self._fn_is_same(d1, d2, 'day'),
+            'isSameMonth': lambda d1, d2: self._fn_is_same(d1, d2, 'month'),
+            'isSameYear': lambda d1, d2: self._fn_is_same(d1, d2, 'year'),
+            'isWeekend': self._fn_is_weekend,
+            'isWeekday': lambda d: not self._fn_is_weekend(d),
+            'toTimestamp': self._fn_to_timestamp,
+            'fromTimestamp': self._fn_from_timestamp,
+            'toISOString': lambda d: self._fn_datetime(d).isoformat() if d else None,
+            
+            # Conditional functions
+            'if': self._fn_if,
+            'iif': self._fn_if,  # alias
+            'case': self._fn_case,
+            'coalesce': self._fn_coalesce,
+            'nullif': lambda x, y: None if x == y else x,
+            'nvl': lambda x, default: x if x is not None else default,
+            'ifnull': lambda x, default: x if x is not None else default,  # alias
+            'isnull': lambda x: x is None,
+            'isnotnull': lambda x: x is not None,
+            'isempty': lambda x: x is None or (isinstance(x, str) and x.strip() == ''),
+            'isblank': lambda x: x is None or (isinstance(x, str) and x.strip() == ''),  # alias
+            
+            # Advanced logic operators (SQL-like)
+            'between': self._fn_between,
+            'not_between': lambda x, low, high: not self._fn_between(x, low, high),
+            'in_list': self._fn_in_list,
+            'not_in_list': lambda x, *values: not self._fn_in_list(x, *values),
+            'like': self._fn_like,
+            'not_like': lambda x, pattern: not self._fn_like(x, pattern),
+            'ilike': self._fn_ilike,  # case-insensitive LIKE
+            'not_ilike': lambda x, pattern: not self._fn_ilike(x, pattern),
+            'regex': self._fn_regex_match,  # alias for regex_match
+            'not_regex': lambda x, pattern: not self._fn_regex_match(x, pattern),
+            'regex_extract': self._fn_regex_extract,
+            'regex_extract_all': self._fn_regex_extract_all,
+            
+            # Boolean logic operators
+            'AND': lambda *args: all(args),
+            'OR': lambda *args: any(args),
+            'NOT': lambda x: not x,
+            'XOR': lambda a, b: bool(a) != bool(b),
+            'NAND': lambda *args: not all(args),
+            'NOR': lambda *args: not any(args),
+            
+            # Comparison operators as functions
+            'eq': lambda a, b: a == b,
+            'ne': lambda a, b: a != b,
+            'lt': lambda a, b: a < b if a is not None and b is not None else False,
+            'le': lambda a, b: a <= b if a is not None and b is not None else False,
+            'gt': lambda a, b: a > b if a is not None and b is not None else False,
+            'ge': lambda a, b: a >= b if a is not None and b is not None else False,
+            
+            # Ternary and switch expressions
+            'switch': self._fn_switch,
+            'choose': self._fn_choose,
+            'decode': self._fn_decode,  # Oracle-style DECODE
+            
+            # Type checking functions
+            'is_number': self._fn_is_number,
+            'is_integer': self._fn_is_integer,
+            'is_decimal': self._fn_is_decimal,
+            'is_date': self._fn_is_date,
+            'is_boolean': lambda x: isinstance(x, bool),
+            'is_string': lambda x: isinstance(x, str),
+            'is_list': lambda x: isinstance(x, (list, tuple)),
+            'typeof': self._fn_typeof,
+            
+            # Lookup/mapping functions
+            'map': self._fn_map,
+            'lookup': self._fn_map,  # alias
+            
+            # List/array functions
+            'first': lambda lst: lst[0] if lst and len(lst) > 0 else None,
+            'last': lambda lst: lst[-1] if lst and len(lst) > 0 else None,
+            'at': lambda lst, idx: lst[int(idx)] if lst and 0 <= int(idx) < len(lst) else None,
+            'size': lambda lst: len(lst) if lst is not None else 0,
+            'reverse': lambda lst: list(reversed(lst)) if lst is not None else None,
+            'sort': lambda lst: sorted(lst) if lst is not None else None,
+            'unique': lambda lst: list(dict.fromkeys(lst)) if lst is not None else None,
+            'flatten': self._fn_flatten,
+            
+            # Utility functions
+            'uuid': lambda: str(__import__('uuid').uuid4()),
+            'hash': lambda x: hash(str(x)) if x is not None else None,
+            'md5': lambda x: __import__('hashlib').md5(str(x).encode()).hexdigest() if x is not None else None,
+            'constant': lambda x: x,  # Return a constant value
+            'literal': lambda x: x,  # alias
+        }
+    
+    # =========================================================================
+    # FUNCTION IMPLEMENTATIONS
+    # =========================================================================
+    
+    def _fn_concat(self, *args) -> Optional[str]:
+        """Concatenate strings, handling nulls."""
+        parts = []
+        for arg in args:
+            if arg is not None:
+                parts.append(str(arg))
+        return ''.join(parts) if parts else None
+    
+    def _fn_substring(self, s, start, length=None) -> Optional[str]:
+        """Extract substring from string."""
+        if s is None:
+            return None
+        s = str(s)
+        start = int(start)
+        if length is not None:
+            return s[start:start + int(length)]
+        return s[start:]
+    
+    def _fn_regex_match(self, s, pattern) -> bool:
+        """Check if string matches regex pattern."""
+        if s is None or pattern is None:
+            return False
+        return bool(re.match(pattern, str(s)))
+    
+    def _fn_regex_replace(self, s, pattern, replacement) -> Optional[str]:
+        """Replace regex matches in string."""
+        if s is None:
+            return None
+        return re.sub(pattern, replacement, str(s))
+    
+    def _fn_avg(self, *args) -> Optional[float]:
+        """Calculate average of non-null values."""
+        values = [float(x) for x in args if x is not None]
+        return sum(values) / len(values) if values else None
+    
+    def _fn_int(self, x) -> Optional[int]:
+        """Convert to integer safely."""
+        if x is None:
+            return None
+        try:
+            if isinstance(x, str):
+                x = x.strip()
+                if x.lower() in ('', 'null', 'none', 'nan'):
+                    return None
+            return int(float(x))
+        except (ValueError, TypeError):
+            return None
+    
+    def _fn_float(self, x) -> Optional[float]:
+        """Convert to float safely."""
+        if x is None:
+            return None
+        try:
+            if isinstance(x, str):
+                x = x.strip()
+                if x.lower() in ('', 'null', 'none', 'nan'):
+                    return None
+            return float(x)
+        except (ValueError, TypeError):
+            return None
+    
+    def _fn_bool(self, x) -> Optional[bool]:
+        """Convert to boolean safely."""
+        if x is None:
+            return None
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, (int, float)):
+            return bool(x)
+        if isinstance(x, str):
+            x = x.strip().lower()
+            if x in ('true', 'yes', '1', 'y', 't', 'on'):
+                return True
+            if x in ('false', 'no', '0', 'n', 'f', 'off', ''):
+                return False
+        return None
+    
+    def _fn_decimal(self, x, precision=None) -> Optional[Decimal]:
+        """Convert to Decimal safely."""
+        if x is None:
+            return None
+        try:
+            if isinstance(x, str):
+                x = x.strip()
+                if x.lower() in ('', 'null', 'none', 'nan'):
+                    return None
+            d = Decimal(str(x))
+            if precision is not None:
+                d = round(d, int(precision))
+            return d
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+    
+    def _fn_date(self, x) -> Optional[date]:
+        """Convert to date safely."""
+        if x is None:
+            return None
+        if isinstance(x, datetime):
+            return x.date()
+        if isinstance(x, date):
+            return x
+        try:
+            return date_parser.parse(str(x)).date()
+        except (ValueError, TypeError):
+            return None
+    
+    def _fn_datetime(self, x) -> Optional[datetime]:
+        """Convert to datetime safely."""
+        if x is None:
+            return None
+        if isinstance(x, datetime):
+            return x
+        if isinstance(x, date):
+            return datetime.combine(x, datetime.min.time())
+        try:
+            return date_parser.parse(str(x))
+        except (ValueError, TypeError):
+            return None
+    
+    def _fn_time(self, x) -> Optional[time]:
+        """Convert to time object safely."""
+        if x is None:
+            return None
+        if isinstance(x, time):
+            return x
+        if isinstance(x, datetime):
+            return x.time()
+        try:
+            # Parse HH:MM:SS or HH:MM format
+            str_val = str(x).strip()
+            parts = str_val.split(':')
+            if len(parts) >= 2:
+                hour = int(parts[0])
+                minute = int(parts[1])
+                second = int(parts[2]) if len(parts) > 2 else 0
+                return time(hour, minute, second)
+            return None
+        except (ValueError, TypeError):
+            return None
+    
+    def _fn_time_parse(self, s, fmt=None) -> Optional[time]:
+        """Parse string to time object."""
+        if s is None:
+            return None
+        try:
+            str_val = str(s).strip()
+            if fmt:
+                dt = datetime.strptime(str_val, fmt)
+                return dt.time()
+            # Default HH:MM:SS parsing
+            return self._fn_time(str_val)
+        except (ValueError, TypeError):
+            return None
+    
+    def _fn_date_format(self, d, fmt='%Y-%m-%d') -> Optional[str]:
+        """Format date/datetime as string."""
+        if d is None:
+            return None
+        dt = self._fn_datetime(d)
+        if dt is None:
+            return None
+        return dt.strftime(fmt)
+    
+    def _fn_date_parse(self, s, fmt=None) -> Optional[datetime]:
+        """Parse string to datetime."""
+        if s is None:
+            return None
+        try:
+            if fmt:
+                return datetime.strptime(str(s), fmt)
+            return date_parser.parse(str(s))
+        except (ValueError, TypeError):
+            return None
+    
+    def _fn_date_add(self, d, value, unit='days') -> Optional[datetime]:
+        """Add time to a date."""
+        if d is None:
+            return None
+        dt = self._fn_datetime(d)
+        if dt is None:
+            return None
+        value = int(value)
+        unit = unit.lower()
+        if unit in ('day', 'days', 'd'):
+            return dt + timedelta(days=value)
+        elif unit in ('hour', 'hours', 'h'):
+            return dt + timedelta(hours=value)
+        elif unit in ('minute', 'minutes', 'm'):
+            return dt + timedelta(minutes=value)
+        elif unit in ('second', 'seconds', 's'):
+            return dt + timedelta(seconds=value)
+        elif unit in ('week', 'weeks', 'w'):
+            return dt + timedelta(weeks=value)
+        elif unit in ('month', 'months'):
+            return dt + relativedelta(months=value)
+        elif unit in ('year', 'years', 'y'):
+            return dt + relativedelta(years=value)
+        return dt
+    
+    def _fn_date_diff(self, d1, d2, unit='days') -> Optional[int]:
+        """Calculate difference between two dates."""
+        if d1 is None or d2 is None:
+            return None
+        dt1 = self._fn_datetime(d1)
+        dt2 = self._fn_datetime(d2)
+        if dt1 is None or dt2 is None:
+            return None
+        delta = dt1 - dt2
+        unit = unit.lower()
+        if unit in ('day', 'days', 'd'):
+            return delta.days
+        elif unit in ('hour', 'hours', 'h'):
+            return int(delta.total_seconds() / 3600)
+        elif unit in ('minute', 'minutes', 'm'):
+            return int(delta.total_seconds() / 60)
+        elif unit in ('second', 'seconds', 's'):
+            return int(delta.total_seconds())
+        return delta.days
+    
+    def _fn_date_part(self, d, part) -> Optional[int]:
+        """Extract part from date/datetime."""
+        if d is None:
+            return None
+        dt = self._fn_datetime(d)
+        if dt is None:
+            return None
+        if part == 'year':
+            return dt.year
+        elif part == 'month':
+            return dt.month
+        elif part == 'day':
+            return dt.day
+        elif part == 'hour':
+            return dt.hour
+        elif part == 'minute':
+            return dt.minute
+        elif part == 'second':
+            return dt.second
+        elif part == 'millisecond':
+            return dt.microsecond // 1000
+        elif part == 'weekday':
+            return dt.weekday()
+        elif part == 'dayofyear':
+            return dt.timetuple().tm_yday
+        elif part == 'week':
+            return dt.isocalendar()[1]
+        elif part == 'quarter':
+            return (dt.month - 1) // 3 + 1
+        return None
+    
+    def _fn_is_leap_year(self, d) -> Optional[bool]:
+        """Check if year is a leap year."""
+        if d is None:
+            return None
+        dt = self._fn_datetime(d)
+        if dt is None:
+            return None
+        year = dt.year
+        return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    
+    def _fn_days_in_month(self, d) -> Optional[int]:
+        """Get number of days in month."""
+        if d is None:
+            return None
+        dt = self._fn_datetime(d)
+        if dt is None:
+            return None
+        import calendar
+        return calendar.monthrange(dt.year, dt.month)[1]
+    
+    def _fn_start_of(self, d, unit) -> Optional[datetime]:
+        """Get start of day/month/year."""
+        if d is None:
+            return None
+        dt = self._fn_datetime(d)
+        if dt is None:
+            return None
+        if unit == 'day':
+            return datetime(dt.year, dt.month, dt.day, 0, 0, 0)
+        elif unit == 'month':
+            return datetime(dt.year, dt.month, 1, 0, 0, 0)
+        elif unit == 'year':
+            return datetime(dt.year, 1, 1, 0, 0, 0)
+        return dt
+    
+    def _fn_end_of(self, d, unit) -> Optional[datetime]:
+        """Get end of day/month/year."""
+        if d is None:
+            return None
+        dt = self._fn_datetime(d)
+        if dt is None:
+            return None
+        if unit == 'day':
+            return datetime(dt.year, dt.month, dt.day, 23, 59, 59, 999999)
+        elif unit == 'month':
+            import calendar
+            last_day = calendar.monthrange(dt.year, dt.month)[1]
+            return datetime(dt.year, dt.month, last_day, 23, 59, 59, 999999)
+        elif unit == 'year':
+            return datetime(dt.year, 12, 31, 23, 59, 59, 999999)
+        return dt
+    
+    def _fn_compare_dates(self, d1, d2) -> int:
+        """Compare two dates. Returns -1, 0, or 1."""
+        if d1 is None or d2 is None:
+            return 0
+        dt1 = self._fn_datetime(d1)
+        dt2 = self._fn_datetime(d2)
+        if dt1 is None or dt2 is None:
+            return 0
+        if dt1 < dt2:
+            return -1
+        elif dt1 > dt2:
+            return 1
+        return 0
+    
+    def _fn_is_same(self, d1, d2, unit) -> bool:
+        """Check if two dates are the same day/month/year."""
+        if d1 is None or d2 is None:
+            return False
+        dt1 = self._fn_datetime(d1)
+        dt2 = self._fn_datetime(d2)
+        if dt1 is None or dt2 is None:
+            return False
+        if unit == 'day':
+            return dt1.date() == dt2.date()
+        elif unit == 'month':
+            return dt1.year == dt2.year and dt1.month == dt2.month
+        elif unit == 'year':
+            return dt1.year == dt2.year
+        return False
+    
+    def _fn_is_weekend(self, d) -> bool:
+        """Check if date is weekend (Saturday=5 or Sunday=6)."""
+        if d is None:
+            return False
+        dt = self._fn_datetime(d)
+        if dt is None:
+            return False
+        return dt.weekday() >= 5
+    
+    def _fn_to_timestamp(self, d) -> Optional[int]:
+        """Convert date to Unix timestamp (seconds since epoch)."""
+        if d is None:
+            return None
+        dt = self._fn_datetime(d)
+        if dt is None:
+            return None
+        return int(dt.timestamp())
+    
+    def _fn_from_timestamp(self, ts) -> Optional[datetime]:
+        """Convert Unix timestamp to datetime."""
+        if ts is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(ts))
+        except (ValueError, TypeError, OSError):
+            return None
+    
+    def _fn_format(self, template, *args):
+        """Format string with arguments (sprintf-style)."""
+        if template is None:
+            return None
+        try:
+            if args:
+                return str(template) % args
+            return str(template)
+        except (TypeError, ValueError):
+            return str(template)
+    
+    def _fn_if(self, condition, then_value, else_value=None):
+        """Conditional if-then-else."""
+        if condition:
+            return then_value
+        return else_value
+    
+    def _fn_case(self, value, *args):
+        """
+        CASE expression: case(value, match1, result1, match2, result2, ..., default)
+        If odd number of args after value, last is default.
+        """
+        default = None
+        pairs = list(args)
+        if len(pairs) % 2 == 1:
+            default = pairs.pop()
+        
+        for i in range(0, len(pairs), 2):
+            if value == pairs[i]:
+                return pairs[i + 1]
+        return default
+    
+    def _fn_coalesce(self, *args):
+        """Return first non-null value."""
+        for arg in args:
+            if arg is not None:
+                return arg
+        return None
+    
+    def _fn_map(self, value, mapping_dict, default=None):
+        """Map value using a dictionary."""
+        if not isinstance(mapping_dict, dict):
+            return default
+        return mapping_dict.get(value, default)
+    
+    def _fn_flatten(self, lst):
+        """Flatten nested lists."""
+        if lst is None:
+            return None
+        result = []
+        for item in lst:
+            if isinstance(item, list):
+                result.extend(self._fn_flatten(item))
+            else:
+                result.append(item)
+        return result
+    
+    # =========================================================================
+    # ADVANCED LOGIC OPERATOR IMPLEMENTATIONS
+    # =========================================================================
+    
+    def _fn_between(self, x, low, high) -> bool:
+        """Check if value is between low and high (inclusive)."""
+        if x is None or low is None or high is None:
+            return False
+        try:
+            return low <= x <= high
+        except TypeError:
+            # Try numeric comparison
+            try:
+                return float(low) <= float(x) <= float(high)
+            except (ValueError, TypeError):
+                return False
+    
+    def _fn_in_list(self, x, *values) -> bool:
+        """Check if value is in list of values (SQL IN operator)."""
+        if x is None:
+            return False
+        # Handle single list argument
+        if len(values) == 1 and isinstance(values[0], (list, tuple)):
+            values = values[0]
+        return x in values
+    
+    def _fn_like(self, s, pattern) -> bool:
+        """SQL LIKE pattern matching. Supports % (any chars) and _ (single char)."""
+        if s is None or pattern is None:
+            return False
+        s = str(s)
+        # Convert SQL LIKE pattern to regex
+        regex_pattern = pattern.replace('%', '.*').replace('_', '.')
+        # Escape other regex special chars but keep .* and .
+        regex_pattern = '^' + regex_pattern + '$'
+        try:
+            return bool(re.match(regex_pattern, s))
+        except re.error:
+            return False
+    
+    def _fn_ilike(self, s, pattern) -> bool:
+        """Case-insensitive LIKE pattern matching."""
+        if s is None or pattern is None:
+            return False
+        s = str(s).lower()
+        pattern = pattern.lower()
+        return self._fn_like(s, pattern)
+    
+    def _fn_regex_extract(self, s, pattern, group=0) -> Optional[str]:
+        """Extract first regex match from string."""
+        if s is None or pattern is None:
+            return None
+        try:
+            match = re.search(pattern, str(s))
+            if match:
+                if group == 0:
+                    return match.group(0)
+                elif group <= len(match.groups()):
+                    return match.group(group)
+            return None
+        except re.error:
+            return None
+    
+    def _fn_regex_extract_all(self, s, pattern) -> Optional[list]:
+        """Extract all regex matches from string."""
+        if s is None or pattern is None:
+            return None
+        try:
+            return re.findall(pattern, str(s))
+        except re.error:
+            return None
+    
+    def _fn_switch(self, value, *cases):
+        """
+        Switch expression: switch(value, case1, result1, case2, result2, ..., default)
+        Similar to case() but evaluates conditions.
+        """
+        default = None
+        pairs = list(cases)
+        if len(pairs) % 2 == 1:
+            default = pairs.pop()
+        
+        for i in range(0, len(pairs), 2):
+            if value == pairs[i]:
+                return pairs[i + 1]
+        return default
+    
+    def _fn_choose(self, index, *values):
+        """
+        Choose value by index: choose(2, 'a', 'b', 'c') returns 'b' (1-indexed).
+        """
+        if index is None:
+            return None
+        try:
+            idx = int(index) - 1  # 1-indexed
+            if 0 <= idx < len(values):
+                return values[idx]
+            return None
+        except (ValueError, TypeError):
+            return None
+    
+    def _fn_decode(self, expr, *pairs):
+        """
+        Oracle-style DECODE: decode(expr, search1, result1, search2, result2, ..., default)
+        """
+        default = None
+        args = list(pairs)
+        if len(args) % 2 == 1:
+            default = args.pop()
+        
+        for i in range(0, len(args), 2):
+            if expr == args[i]:
+                return args[i + 1]
+        return default
+    
+    def _fn_is_number(self, x) -> bool:
+        """Check if value is a number or can be converted to number."""
+        if x is None:
+            return False
+        if isinstance(x, (int, float, Decimal)):
+            return True
+        if isinstance(x, str):
+            try:
+                float(x)
+                return True
+            except ValueError:
+                return False
+        return False
+    
+    def _fn_is_integer(self, x) -> bool:
+        """Check if value is an integer or can be converted to integer."""
+        if x is None:
+            return False
+        if isinstance(x, int) and not isinstance(x, bool):
+            return True
+        if isinstance(x, float):
+            return x.is_integer()
+        if isinstance(x, str):
+            try:
+                val = float(x)
+                return val.is_integer()
+            except ValueError:
+                return False
+        return False
+    
+    def _fn_is_decimal(self, x) -> bool:
+        """Check if value is a decimal number (has fractional part)."""
+        if x is None:
+            return False
+        if isinstance(x, Decimal):
+            return True
+        if isinstance(x, float):
+            return not x.is_integer()
+        if isinstance(x, str):
+            try:
+                val = float(x)
+                return not val.is_integer()
+            except ValueError:
+                return False
+        return False
+    
+    def _fn_is_date(self, x) -> bool:
+        """Check if value is a date or can be parsed as date."""
+        if x is None:
+            return False
+        if isinstance(x, (date, datetime)):
+            return True
+        if isinstance(x, str):
+            try:
+                date_parser.parse(x)
+                return True
+            except (ValueError, TypeError):
+                return False
+        return False
+    
+    def _fn_typeof(self, x) -> str:
+        """Return the type name of a value."""
+        if x is None:
+            return 'null'
+        if isinstance(x, bool):
+            return 'boolean'
+        if isinstance(x, int):
+            return 'integer'
+        if isinstance(x, float):
+            return 'float'
+        if isinstance(x, Decimal):
+            return 'decimal'
+        if isinstance(x, str):
+            return 'string'
+        if isinstance(x, datetime):
+            return 'datetime'
+        if isinstance(x, date):
+            return 'date'
+        if isinstance(x, (list, tuple)):
+            return 'list'
+        if isinstance(x, dict):
+            return 'object'
+        return type(x).__name__
+    
+    # =========================================================================
+    # EXPRESSION PARSING AND EVALUATION
+    # =========================================================================
+    
+    def _get_nested_value(self, record: Dict[str, Any], path: str) -> Any:
+        """Get value from record using dot notation for nested fields."""
+        parts = path.split('.')
+        value = record
+        for part in parts:
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                return None
+        return value
+    
+    def _substitute_column_refs(self, expression: str, record: Dict[str, Any]) -> str:
+        """Replace ${column_name} references with actual values."""
+        def replace_ref(match):
+            column_path = match.group(1)
+            value = self._get_nested_value(record, column_path)
+            if value is None:
+                return 'None'
+            elif isinstance(value, str):
+                # Escape quotes in strings and wrap in quotes
+                escaped = value.replace('\\', '\\\\').replace("'", "\\'")
+                return f"'{escaped}'"
+            elif isinstance(value, bool):
+                return 'True' if value else 'False'
+            elif isinstance(value, (int, float, Decimal)):
+                return str(value)
+            elif isinstance(value, (datetime, date)):
+                return f"'{value.isoformat()}'"
+            elif isinstance(value, (list, dict)):
+                return repr(value)
+            else:
+                return repr(value)
+        
+        return self.COLUMN_REF_PATTERN.sub(replace_ref, expression)
+    
+    def _safe_eval(self, expression: str, record: Dict[str, Any]) -> Any:
+        """
+        Safely evaluate an expression with column references substituted.
+        """
+        # Substitute column references
+        substituted = self._substitute_column_refs(expression, record)
+        
+        # Build safe evaluation context
+        safe_context = {
+            '__builtins__': {},  # Disable all builtins for security
+            'True': True,
+            'False': False,
+            'None': None,
+        }
+        
+        # Add all registered functions
+        safe_context.update(self.functions)
+        
+        # Add operators as functions for complex expressions
+        safe_context.update({
+            'and_': lambda a, b: a and b,
+            'or_': lambda a, b: a or b,
+            'not_': lambda a: not a,
+        })
+        
+        try:
+            # Evaluate the expression
+            result = eval(substituted, safe_context)
+            return result
+        except Exception as e:
+            logger.warning(f"Expression evaluation failed: {expression} -> {substituted}. Error: {e}")
+            return None
+    
+    def _convert_type(self, value: Any, data_type: Optional[str]) -> Any:
+        """Convert value to specified data type."""
+        if value is None or data_type is None:
+            return value
+        
+        data_type = data_type.lower()
+        
+        if data_type in ('string', 'str', 'varchar', 'text'):
+            return str(value) if value is not None else None
+        elif data_type in ('int', 'integer', 'bigint'):
+            return self._fn_int(value)
+        elif data_type in ('float', 'double', 'real'):
+            return self._fn_float(value)
+        elif data_type in ('decimal', 'numeric'):
+            return self._fn_decimal(value)
+        elif data_type in ('bool', 'boolean'):
+            return self._fn_bool(value)
+        elif data_type in ('date',):
+            return self._fn_date(value)
+        elif data_type in ('datetime', 'timestamp'):
+            return self._fn_datetime(value)
+        
+        return value
+    
+    def evaluate_expression(
+        self, 
+        expression: str, 
+        record: Dict[str, Any],
+        default: Any = None,
+        data_type: Optional[str] = None
+    ) -> Any:
+        """
+        Evaluate a single expression against a record.
+        
+        Args:
+            expression: Expression string with ${column} references
+            record: Source record dictionary
+            default: Default value if expression evaluates to None or fails
+            data_type: Optional target data type for conversion
+            
+        Returns:
+            Evaluated value
+        """
+        try:
+            result = self._safe_eval(expression, record)
+            
+            # Apply default if result is None
+            if result is None and default is not None:
+                result = default
+            
+            # Apply type conversion
+            if data_type:
+                result = self._convert_type(result, data_type)
+            
+            return result
+        except Exception as e:
+            logger.error(f"Expression evaluation error: {expression}. Error: {e}")
+            return default
+    
+    def evaluate_record(
+        self, 
+        record: Dict[str, Any], 
+        config: ExpressionConfig,
+        source_record: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Evaluate all expressions for a single record.
+        
+        Args:
+            record: Current record dictionary (after mapping/JOLT)
+            config: Expression configuration
+            source_record: Original source record for column references (optional)
+                          If provided, expressions reference source columns.
+                          If not provided, expressions reference current record columns.
+            
+        Returns:
+            New record with evaluated expressions
+        """
+        result = {}
+        
+        # Optionally preserve unmapped columns from current record
+        if config.preserve_unmapped:
+            result = dict(record)
+        
+        # Use source_record for expression evaluation if provided, otherwise use current record
+        # This allows expressions to reference original source columns while creating target columns
+        eval_record = source_record if source_record is not None else record
+        
+        # Get available columns for expr-eval syntax conversion
+        available_columns = list(eval_record.keys()) if eval_record else None
+        
+        # Evaluate each expression using source data, store in target columns
+        for expr_config in config.expressions:
+            try:
+                # Normalize expression to template syntax (supports expr-eval 2.0.2)
+                syntax = expr_config.syntax if expr_config.syntax else 'auto'
+                normalized_expr = self.normalize_expression(
+                    expr_config.expression, 
+                    syntax, 
+                    available_columns
+                )
+                
+                value = self.evaluate_expression(
+                    normalized_expr,
+                    eval_record,  # Use source record for column references
+                    expr_config.default,
+                    expr_config.data_type
+                )
+                result[expr_config.target_column] = value
+            except Exception as e:
+                logger.error(f"Failed to evaluate expression for column {expr_config.target_column}: {e}")
+                result[expr_config.target_column] = expr_config.default
+        
+        return result
+    
+    async def evaluate_batch(
+        self, 
+        records: List[Dict[str, Any]], 
+        config: ExpressionConfig,
+        source_records: Optional[List[Dict[str, Any]]] = None,
+        use_parallel: bool = True,
+        chunk_size: int = 5000
+    ) -> List[Dict[str, Any]]:
+        """
+        Evaluate expressions for a batch of records with performance optimizations.
+        
+        Args:
+            records: List of current records (after mapping/JOLT)
+            config: Expression configuration
+            source_records: Optional list of original source records for column references.
+                           If provided, expressions reference source columns while creating
+                           target columns in the output. Must have same length as records.
+            use_parallel: Use parallel processing for large batches (default: True)
+            chunk_size: Chunk size for parallel processing (default: 5000)
+            
+        Returns:
+            List of records with evaluated expressions
+        """
+        if not records:
+            return []
+        
+        record_count = len(records)
+        expression_count = len(config.expressions)
+        
+        # Validate source_records length if provided
+        if source_records is not None and len(source_records) != record_count:
+            logger.warning(f"source_records length ({len(source_records)}) doesn't match records length ({record_count}). Using current records for evaluation.")
+            source_records = None
+        
+        # For small batches, use simple sequential processing
+        if record_count < 1000 or not use_parallel:
+            results = []
+            for i, record in enumerate(records):
+                source_rec = source_records[i] if source_records else None
+                evaluated = self.evaluate_record(record, config, source_rec)
+                results.append(evaluated)
+            logger.info(f"Evaluated expressions for {len(results)} records ({expression_count} expressions) - sequential")
+            return results
+        
+        # For large batches, use parallel processing with chunking
+        import concurrent.futures
+        import asyncio
+        
+        def process_chunk(chunk_data: tuple) -> List[Dict[str, Any]]:
+            """Process a chunk of records."""
+            chunk_records, chunk_sources = chunk_data
+            chunk_results = []
+            for i, record in enumerate(chunk_records):
+                source_rec = chunk_sources[i] if chunk_sources else None
+                evaluated = self.evaluate_record(record, config, source_rec)
+                chunk_results.append(evaluated)
+            return chunk_results
+        
+        # Split records into chunks (with corresponding source records if provided)
+        chunks = []
+        for i in range(0, record_count, chunk_size):
+            chunk_records = records[i:i + chunk_size]
+            chunk_sources = source_records[i:i + chunk_size] if source_records else None
+            chunks.append((chunk_records, chunk_sources))
+        
+        # Process chunks in parallel using ThreadPoolExecutor
+        loop = asyncio.get_event_loop()
+        results = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(chunks), 8)) as executor:
+            futures = [loop.run_in_executor(executor, process_chunk, chunk_data) for chunk_data in chunks]
+            chunk_results = await asyncio.gather(*futures)
+            
+            for chunk_result in chunk_results:
+                results.extend(chunk_result)
+        
+        logger.info(f"Evaluated expressions for {len(results)} records ({expression_count} expressions) - parallel ({len(chunks)} chunks)")
+        return results
+
+
+# =============================================================================
+# EXPRESSION PROCESSOR (for ETL Pipeline integration)
+# =============================================================================
+
+class ExpressionProcessor:
+    """
+    Processor for expression evaluation in ETL pipelines.
+    
+    Provides a simple interface for integrating expression evaluation
+    into the ETL pipeline alongside other processors like JOLT and aggregation.
+    """
+    
+    def __init__(self):
+        """Initialize the expression processor."""
+        self.evaluator = ExpressionEvaluator()
+    
+    async def process(
+        self, 
+        records: List[Dict[str, Any]], 
+        config: ExpressionConfig,
+        source_records: Optional[List[Dict[str, Any]]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process records through expression evaluation.
+        
+        Args:
+            records: List of current records to process (after mapping/JOLT)
+            config: Expression configuration
+            source_records: Optional list of original source records for column references.
+                           If provided, expressions can reference source columns via ${column}
+                           while creating new target columns in the output.
+            
+        Returns:
+            List of processed records with expression results
+        """
+        return await self.evaluator.evaluate_batch(records, config, source_records)
+
+
+# =============================================================================
+# CONVENIENCE FUNCTIONS
+# =============================================================================
+
+async def evaluate_expressions(
+    records: List[Dict[str, Any]], 
+    config: ExpressionConfig
+) -> List[Dict[str, Any]]:
+    """
+    Convenience function for evaluating expressions on records.
+    
+    Args:
+        records: List of records to process
+        config: Expression configuration
+        
+    Returns:
+        List of records with evaluated expressions
+    """
+    processor = ExpressionProcessor()
+    return await processor.process(records, config)
+
+
+def create_expression_config(
+    expressions: List[Dict[str, Any]],
+    preserve_unmapped: bool = False
+) -> ExpressionConfig:
+    """
+    Create an ExpressionConfig from a list of expression dictionaries.
+    
+    Args:
+        expressions: List of expression configs
+        preserve_unmapped: Whether to preserve unmapped source columns
+        
+    Returns:
+        ExpressionConfig instance
+    """
+    column_expressions = [
+        ColumnExpression(
+            target_column=e.get('target_column', e.get('target')),
+            expression=e.get('expression'),
+            default=e.get('default'),
+            data_type=e.get('data_type', e.get('type'))
+        )
+        for e in expressions
+    ]
+    return ExpressionConfig(expressions=column_expressions, preserve_unmapped=preserve_unmapped)
+
+
+# =============================================================================
+# REACT-QUERYBUILDER SUPPORT
+# =============================================================================
+
+class QueryBuilderRule(BaseModel):
+    """
+    A single rule from react-querybuilder JSON output.
+    
+    Supports react-querybuilder 8.x format with field, operator, value.
+    """
+    field: str = Field(..., description="Field name to evaluate")
+    operator: str = Field(..., description="Comparison operator")
+    value: Any = Field(default=None, description="Value to compare against")
+    valueSource: Optional[str] = Field(default=None, description="Source of value: 'value' or 'field'")
+
+
+class QueryBuilderRuleGroup(BaseModel):
+    """
+    A rule group from react-querybuilder JSON output.
+    
+    Can contain rules and nested rule groups combined with 'and'/'or'.
+    """
+    combinator: str = Field(default="and", description="Combinator: 'and' or 'or'")
+    rules: List[Union["QueryBuilderRuleGroup", QueryBuilderRule]] = Field(default_factory=list)
+    not_: bool = Field(default=False, alias="not", description="Negate the entire group")
+    
+    class Config:
+        populate_by_name = True
+
+
+# Update forward references for nested model
+QueryBuilderRuleGroup.model_rebuild()
+
+
+class QueryBuilderConfig(BaseModel):
+    """
+    Configuration for react-querybuilder integration.
+    
+    Accepts react-querybuilder JSON output and converts it to filter/transform expressions.
+    
+    Example react-querybuilder output:
+    ```json
+    {
+        "combinator": "and",
+        "rules": [
+            {"field": "age", "operator": ">", "value": 30},
+            {"field": "status", "operator": "=", "value": "active"},
+            {
+                "combinator": "or",
+                "rules": [
+                    {"field": "department", "operator": "=", "value": "Sales"},
+                    {"field": "department", "operator": "=", "value": "Marketing"}
+                ]
+            }
+        ]
+    }
+    ```
+    """
+    target_column: str = Field(..., description="Target column to store the result")
+    query: QueryBuilderRuleGroup = Field(..., description="React-querybuilder JSON output")
+    result_if_true: Any = Field(default=True, description="Value if query matches")
+    result_if_false: Any = Field(default=False, description="Value if query doesn't match")
+    default: Any = Field(default=None, description="Default value on error")
+
+
+class QueryBuilderParser:
+    """
+    Parser for react-querybuilder JSON output.
+    
+    Converts react-querybuilder rules to executable expressions that can be
+    evaluated against records. Supports all standard operators from react-querybuilder.
+    """
+    
+    # Operator mapping from react-querybuilder to Python/expression evaluator
+    OPERATOR_MAP = {
+        # Equality
+        '=': '==',
+        '==': '==',
+        '!=': '!=',
+        '<>': '!=',
+        
+        # Comparison
+        '<': '<',
+        '>': '>',
+        '<=': '<=',
+        '>=': '>=',
+        
+        # String operators
+        'contains': 'contains',
+        'doesNotContain': 'not_contains',
+        'beginsWith': 'starts_with',
+        'doesNotBeginWith': 'not_starts_with',
+        'endsWith': 'ends_with',
+        'doesNotEndWith': 'not_ends_with',
+        
+        # Null checks
+        'null': 'is_null',
+        'notNull': 'is_not_null',
+        
+        # Collection operators
+        'in': 'in',
+        'notIn': 'not_in',
+        'between': 'between',
+        'notBetween': 'not_between',
+    }
+    
+    def __init__(self):
+        """Initialize the parser."""
+        pass
+    
+    def evaluate_rule(self, rule: QueryBuilderRule, record: Dict[str, Any]) -> bool:
+        """
+        Evaluate a single rule against a record.
+        
+        Args:
+            rule: The rule to evaluate
+            record: The record to evaluate against
+            
+        Returns:
+            True if the rule matches, False otherwise
+        """
+        field_value = record.get(rule.field)
+        compare_value = rule.value
+        
+        # If valueSource is 'field', get value from another field
+        if rule.valueSource == 'field' and isinstance(compare_value, str):
+            compare_value = record.get(compare_value)
+        
+        operator = rule.operator
+        
+        try:
+            # Equality operators
+            if operator in ('=', '=='):
+                return field_value == compare_value
+            elif operator in ('!=', '<>'):
+                return field_value != compare_value
+            
+            # Comparison operators
+            elif operator == '<':
+                return field_value is not None and compare_value is not None and field_value < compare_value
+            elif operator == '>':
+                return field_value is not None and compare_value is not None and field_value > compare_value
+            elif operator == '<=':
+                return field_value is not None and compare_value is not None and field_value <= compare_value
+            elif operator == '>=':
+                return field_value is not None and compare_value is not None and field_value >= compare_value
+            
+            # String operators
+            elif operator == 'contains':
+                return field_value is not None and compare_value is not None and str(compare_value) in str(field_value)
+            elif operator == 'doesNotContain':
+                return field_value is None or compare_value is None or str(compare_value) not in str(field_value)
+            elif operator == 'beginsWith':
+                return field_value is not None and compare_value is not None and str(field_value).startswith(str(compare_value))
+            elif operator == 'doesNotBeginWith':
+                return field_value is None or compare_value is None or not str(field_value).startswith(str(compare_value))
+            elif operator == 'endsWith':
+                return field_value is not None and compare_value is not None and str(field_value).endswith(str(compare_value))
+            elif operator == 'doesNotEndWith':
+                return field_value is None or compare_value is None or not str(field_value).endswith(str(compare_value))
+            
+            # Null checks
+            elif operator == 'null':
+                return field_value is None
+            elif operator == 'notNull':
+                return field_value is not None
+            
+            # Collection operators
+            elif operator == 'in':
+                if isinstance(compare_value, list):
+                    return field_value in compare_value
+                elif isinstance(compare_value, str):
+                    # Handle comma-separated values
+                    values = [v.strip() for v in compare_value.split(',')]
+                    return str(field_value) in values
+                return False
+            elif operator == 'notIn':
+                if isinstance(compare_value, list):
+                    return field_value not in compare_value
+                elif isinstance(compare_value, str):
+                    values = [v.strip() for v in compare_value.split(',')]
+                    return str(field_value) not in values
+                return True
+            elif operator == 'between':
+                if isinstance(compare_value, list) and len(compare_value) >= 2:
+                    return field_value is not None and compare_value[0] <= field_value <= compare_value[1]
+                return False
+            elif operator == 'notBetween':
+                if isinstance(compare_value, list) and len(compare_value) >= 2:
+                    return field_value is None or not (compare_value[0] <= field_value <= compare_value[1])
+                return True
+            
+            else:
+                logger.warning(f"Unknown operator: {operator}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error evaluating rule {rule.field} {operator} {compare_value}: {e}")
+            return False
+    
+    def evaluate_group(self, group: QueryBuilderRuleGroup, record: Dict[str, Any]) -> bool:
+        """
+        Evaluate a rule group against a record.
+        
+        Args:
+            group: The rule group to evaluate
+            record: The record to evaluate against
+            
+        Returns:
+            True if the group matches, False otherwise
+        """
+        if not group.rules:
+            return True  # Empty group matches everything
+        
+        results = []
+        for rule in group.rules:
+            if isinstance(rule, QueryBuilderRuleGroup):
+                results.append(self.evaluate_group(rule, record))
+            elif isinstance(rule, QueryBuilderRule):
+                results.append(self.evaluate_rule(rule, record))
+            elif isinstance(rule, dict):
+                # Handle dict input (not yet parsed as model)
+                if 'combinator' in rule:
+                    # It's a nested group
+                    nested_group = QueryBuilderRuleGroup(**rule)
+                    results.append(self.evaluate_group(nested_group, record))
+                else:
+                    # It's a rule
+                    parsed_rule = QueryBuilderRule(**rule)
+                    results.append(self.evaluate_rule(parsed_rule, record))
+        
+        # Apply combinator
+        if group.combinator.lower() == 'and':
+            result = all(results)
+        elif group.combinator.lower() == 'or':
+            result = any(results)
+        else:
+            logger.warning(f"Unknown combinator: {group.combinator}, defaulting to 'and'")
+            result = all(results)
+        
+        # Apply negation if specified
+        if group.not_:
+            result = not result
+        
+        return result
+    
+    def evaluate_record(
+        self, 
+        record: Dict[str, Any], 
+        config: QueryBuilderConfig
+    ) -> Dict[str, Any]:
+        """
+        Evaluate a query builder config against a record.
+        
+        Args:
+            record: The source record
+            config: The query builder configuration
+            
+        Returns:
+            Record with the target column set based on query result
+        """
+        try:
+            matches = self.evaluate_group(config.query, record)
+            result = dict(record)
+            result[config.target_column] = config.result_if_true if matches else config.result_if_false
+            return result
+        except Exception as e:
+            logger.error(f"Error evaluating query builder config: {e}")
+            result = dict(record)
+            result[config.target_column] = config.default
+            return result
+    
+    def evaluate_batch(
+        self, 
+        records: List[Dict[str, Any]], 
+        configs: List[QueryBuilderConfig]
+    ) -> List[Dict[str, Any]]:
+        """
+        Evaluate multiple query builder configs against a batch of records.
+        
+        Args:
+            records: List of source records
+            configs: List of query builder configurations
+            
+        Returns:
+            List of records with target columns set
+        """
+        results = []
+        for record in records:
+            result = dict(record)
+            for config in configs:
+                evaluated = self.evaluate_record(result, config)
+                result.update(evaluated)
+            results.append(result)
+        return results
+    
+    def convert_to_expression(self, group: QueryBuilderRuleGroup) -> str:
+        """
+        Convert a query builder rule group to an expression string.
+        
+        This generates an expression using the ${column} syntax that can be
+        evaluated by the ExpressionEvaluator.
+        
+        Args:
+            group: The rule group to convert
+            
+        Returns:
+            Expression string
+        """
+        if not group.rules:
+            return "True"
+        
+        expressions = []
+        for rule in group.rules:
+            if isinstance(rule, QueryBuilderRuleGroup):
+                expr = f"({self.convert_to_expression(rule)})"
+                expressions.append(expr)
+            elif isinstance(rule, QueryBuilderRule):
+                expr = self._rule_to_expression(rule)
+                expressions.append(expr)
+            elif isinstance(rule, dict):
+                if 'combinator' in rule:
+                    nested_group = QueryBuilderRuleGroup(**rule)
+                    expr = f"({self.convert_to_expression(nested_group)})"
+                    expressions.append(expr)
+                else:
+                    parsed_rule = QueryBuilderRule(**rule)
+                    expr = self._rule_to_expression(parsed_rule)
+                    expressions.append(expr)
+        
+        # Join with combinator
+        joiner = ' and ' if group.combinator.lower() == 'and' else ' or '
+        result = joiner.join(expressions)
+        
+        # Apply negation
+        if group.not_:
+            result = f"not ({result})"
+        
+        return result
+    
+    def _rule_to_expression(self, rule: QueryBuilderRule) -> str:
+        """Convert a single rule to an expression string."""
+        field_ref = f"${{{rule.field}}}"
+        value = rule.value
+        
+        # Quote string values
+        if isinstance(value, str):
+            value_repr = f"'{value}'"
+        elif value is None:
+            value_repr = "None"
+        elif isinstance(value, bool):
+            value_repr = str(value)
+        elif isinstance(value, list):
+            value_repr = str(value)
+        else:
+            value_repr = str(value)
+        
+        operator = rule.operator
+        
+        # Map operators to expressions
+        if operator in ('=', '=='):
+            return f"{field_ref} == {value_repr}"
+        elif operator in ('!=', '<>'):
+            return f"{field_ref} != {value_repr}"
+        elif operator in ('<', '>', '<=', '>='):
+            return f"{field_ref} {operator} {value_repr}"
+        elif operator == 'contains':
+            return f"contains({field_ref}, {value_repr})"
+        elif operator == 'doesNotContain':
+            return f"not contains({field_ref}, {value_repr})"
+        elif operator == 'beginsWith':
+            return f"starts_with({field_ref}, {value_repr})"
+        elif operator == 'doesNotBeginWith':
+            return f"not starts_with({field_ref}, {value_repr})"
+        elif operator == 'endsWith':
+            return f"ends_with({field_ref}, {value_repr})"
+        elif operator == 'doesNotEndWith':
+            return f"not ends_with({field_ref}, {value_repr})"
+        elif operator == 'null':
+            return f"isnull({field_ref})"
+        elif operator == 'notNull':
+            return f"isnotnull({field_ref})"
+        elif operator == 'in':
+            return f"{field_ref} in {value_repr}"
+        elif operator == 'notIn':
+            return f"{field_ref} not in {value_repr}"
+        elif operator == 'between':
+            if isinstance(value, list) and len(value) >= 2:
+                return f"({field_ref} >= {value[0]} and {field_ref} <= {value[1]})"
+            return "False"
+        elif operator == 'notBetween':
+            if isinstance(value, list) and len(value) >= 2:
+                return f"({field_ref} < {value[0]} or {field_ref} > {value[1]})"
+            return "True"
+        else:
+            logger.warning(f"Unknown operator for conversion: {operator}")
+            return "False"
+
+
+class QueryBuilderProcessor:
+    """
+    Processor for react-querybuilder integration in ETL pipelines.
+    
+    Provides methods to evaluate react-querybuilder JSON output against records
+    and create new columns based on query results.
+    """
+    
+    def __init__(self):
+        """Initialize the processor."""
+        self.parser = QueryBuilderParser()
+    
+    async def process(
+        self, 
+        records: List[Dict[str, Any]], 
+        configs: List[QueryBuilderConfig]
+    ) -> List[Dict[str, Any]]:
+        """
+        Process records through query builder evaluation.
+        
+        Args:
+            records: List of records to process
+            configs: List of query builder configurations
+            
+        Returns:
+            List of processed records with new columns
+        """
+        return self.parser.evaluate_batch(records, configs)
+
+
+# =============================================================================
+# EXAMPLE USAGE
+# =============================================================================
+
+if __name__ == "__main__":
+    import asyncio
+    
+    # Sample source data
+    sample_records = [
+        {
+            "first_name": "John",
+            "last_name": "Doe",
+            "quantity": 5,
+            "unit_price": 10.50,
+            "discount": 0.1,
+            "order_date": "2024-01-15",
+            "status": "active"
+        },
+        {
+            "first_name": "Jane",
+            "last_name": "Smith",
+            "quantity": 3,
+            "unit_price": 25.00,
+            "discount": None,
+            "order_date": "2024-01-16",
+            "status": "pending"
+        }
+    ]
+    
+    # Expression configuration
+    config = ExpressionConfig(
+        expressions=[
+            ColumnExpression(
+                target_column="full_name",
+                expression="concat(${first_name}, ' ', ${last_name})",
+                default="Unknown"
+            ),
+            ColumnExpression(
+                target_column="subtotal",
+                expression="${quantity} * ${unit_price}",
+                default=0,
+                data_type="decimal"
+            ),
+            ColumnExpression(
+                target_column="total",
+                expression="${quantity} * ${unit_price} * (1 - coalesce(${discount}, 0))",
+                default=0,
+                data_type="decimal"
+            ),
+            ColumnExpression(
+                target_column="order_year",
+                expression="year(${order_date})",
+                data_type="int"
+            ),
+            ColumnExpression(
+                target_column="is_active",
+                expression="${status} == 'active'",
+                data_type="boolean"
+            ),
+            ColumnExpression(
+                target_column="status_label",
+                expression="if(${status} == 'active', 'Active Order', 'Pending Review')"
+            )
+        ],
+        preserve_unmapped=False
+    )
+    
+    async def test():
+        processor = ExpressionProcessor()
+        results = await processor.process(sample_records, config)
+        print("Expression Evaluation Results:")
+        for record in results:
+            print(record)
+    
+    asyncio.run(test())
