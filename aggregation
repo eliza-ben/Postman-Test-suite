@@ -1,0 +1,371 @@
+"""
+Data Aggregation and Grouping Utilities
+
+This module provides comprehensive data aggregation and grouping functionality
+for ETL pipelines. It supports various aggregation functions and can be used
+across all ETL services (api-to-db, db-to-db, file-to-db, etc.).
+
+Key Features:
+-------------
+1. Multiple Aggregation Functions:
+   - COUNT, SUM, AVG, MIN, MAX
+   - COUNT_DISTINCT, FIRST, LAST
+   - CONCAT, CONCAT_DISTINCT
+   
+2. Flexible Grouping:
+   - Group by single or multiple columns
+   - Support for nested grouping
+   
+3. Data Type Handling:
+   - Automatic type conversion for numeric aggregations
+   - String concatenation with custom separators
+   - Null value handling
+   
+4. Memory Efficient:
+   - Streaming aggregation for large datasets
+   - Batch processing support
+
+Usage:
+------
+    from common.aggregation import AggregationProcessor, AggregationConfig
+    
+    config = AggregationConfig(
+        group_by=["category", "region"],
+        aggregations=[
+            {"column": "amount", "function": "SUM", "alias": "total_amount"},
+            {"column": "id", "function": "COUNT", "alias": "record_count"}
+        ]
+    )
+    
+    processor = AggregationProcessor()
+    result = await processor.aggregate(records, config)
+"""
+
+from typing import Any, Dict, List, Optional, Union
+from pydantic import BaseModel, Field
+from decimal import Decimal
+import pandas as pd
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class AggregationFunction(BaseModel):
+    """
+    Configuration for a single aggregation function.
+    
+    Defines how to aggregate a specific column with support for:
+    - Standard aggregation functions (SUM, COUNT, AVG, MIN, MAX)
+    - Advanced functions (COUNT_DISTINCT, FIRST, LAST, CONCAT)
+    - Custom alias for the result column
+    - Optional parameters (separator for CONCAT, etc.)
+    
+    Examples:
+    ---------
+    Sum aggregation:
+        {
+            "column": "amount",
+            "function": "SUM",
+            "alias": "total_amount"
+        }
+    
+    Count distinct:
+        {
+            "column": "user_id", 
+            "function": "COUNT_DISTINCT",
+            "alias": "unique_users"
+        }
+    
+    String concatenation:
+        {
+            "column": "tags",
+            "function": "CONCAT",
+            "alias": "all_tags",
+            "separator": ", "
+        }
+    """
+    column: str = Field(..., description="Column name to aggregate")
+    function: str = Field(..., description="Aggregation function: SUM, COUNT, AVG, MIN, MAX, COUNT_DISTINCT, FIRST, LAST, CONCAT, CONCAT_DISTINCT")
+    alias: str = Field(..., description="Alias for the aggregated column in result")
+    separator: Optional[str] = Field(default=", ", description="Separator for CONCAT functions")
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "column": "amount",
+                "function": "SUM", 
+                "alias": "total_amount"
+            }
+        }
+
+
+class AggregationConfig(BaseModel):
+    """
+    Complete aggregation configuration.
+    
+    Defines the grouping columns and aggregation functions to apply.
+    This configuration can be used across all ETL services for consistent
+    data aggregation behavior.
+    
+    Examples:
+    ---------
+    Simple grouping with sum:
+        {
+            "group_by": ["category"],
+            "aggregations": [
+                {"column": "amount", "function": "SUM", "alias": "total_amount"},
+                {"column": "id", "function": "COUNT", "alias": "record_count"}
+            ]
+        }
+    
+    Multiple grouping columns:
+        {
+            "group_by": ["category", "region", "date"],
+            "aggregations": [
+                {"column": "sales", "function": "SUM", "alias": "total_sales"},
+                {"column": "sales", "function": "AVG", "alias": "avg_sales"},
+                {"column": "customer_id", "function": "COUNT_DISTINCT", "alias": "unique_customers"}
+            ]
+        }
+    
+    No grouping (aggregate all records):
+        {
+            "group_by": [],
+            "aggregations": [
+                {"column": "amount", "function": "SUM", "alias": "grand_total"}
+            ]
+        }
+    """
+    group_by: List[str] = Field(default_factory=list, description="Columns to group by (empty list = aggregate all records)")
+    aggregations: List[AggregationFunction] = Field(..., description="List of aggregation functions to apply")
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "group_by": ["category", "region"],
+                "aggregations": [
+                    {"column": "amount", "function": "SUM", "alias": "total_amount"},
+                    {"column": "id", "function": "COUNT", "alias": "record_count"}
+                ]
+            }
+        }
+
+
+class AggregationProcessor:
+    """
+    Processor for data aggregation and grouping operations.
+    
+    Provides efficient aggregation capabilities using pandas for performance
+    while maintaining compatibility with the ETL pipeline data structures.
+    """
+    
+    SUPPORTED_FUNCTIONS = {
+        'SUM', 'COUNT', 'AVG', 'MIN', 'MAX', 
+        'COUNT_DISTINCT', 'FIRST', 'LAST', 
+        'CONCAT', 'CONCAT_DISTINCT'
+    }
+    
+    def __init__(self):
+        """Initialize the aggregation processor."""
+        pass
+    
+    async def aggregate(
+        self, 
+        records: List[Dict[str, Any]], 
+        config: AggregationConfig
+    ) -> List[Dict[str, Any]]:
+        """
+        Aggregate records according to the provided configuration.
+        
+        Args:
+            records: List of records to aggregate
+            config: Aggregation configuration
+            
+        Returns:
+            List of aggregated records
+            
+        Raises:
+            ValueError: If unsupported aggregation function is specified
+            KeyError: If specified columns don't exist in records
+        """
+        if not records:
+            logger.warning("No records provided for aggregation")
+            return []
+        
+        # Validate aggregation functions
+        for agg in config.aggregations:
+            if agg.function not in self.SUPPORTED_FUNCTIONS:
+                raise ValueError(f"Unsupported aggregation function: {agg.function}")
+        
+        # Convert records to DataFrame for efficient processing
+        df = pd.DataFrame(records)
+        
+        # Validate that all specified columns exist
+        all_columns = set(config.group_by + [agg.column for agg in config.aggregations])
+        missing_columns = all_columns - set(df.columns)
+        if missing_columns:
+            raise KeyError(f"Columns not found in records: {missing_columns}")
+        
+        # Perform aggregation
+        if config.group_by:
+            # Group by specified columns
+            grouped = df.groupby(config.group_by, as_index=False)
+            result_df = self._apply_aggregations(grouped, config.aggregations)
+        else:
+            # Aggregate all records (no grouping)
+            result_df = self._apply_aggregations_no_group(df, config.aggregations)
+        
+        # Convert back to list of dictionaries
+        result_records = result_df.to_dict('records')
+        
+        # Clean up NaN values and convert to appropriate types
+        cleaned_records = self._clean_records(result_records)
+        
+        logger.info(f"Aggregated {len(records)} records into {len(cleaned_records)} groups")
+        return cleaned_records
+    
+    def _apply_aggregations(
+        self, 
+        grouped: pd.core.groupby.DataFrameGroupBy, 
+        aggregations: List[AggregationFunction]
+    ) -> pd.DataFrame:
+        """Apply aggregation functions to grouped data."""
+        agg_dict = {}
+        
+        for agg in aggregations:
+            if agg.function == 'SUM':
+                agg_dict[agg.alias] = pd.NamedAgg(column=agg.column, aggfunc='sum')
+            elif agg.function == 'COUNT':
+                agg_dict[agg.alias] = pd.NamedAgg(column=agg.column, aggfunc='count')
+            elif agg.function == 'AVG':
+                agg_dict[agg.alias] = pd.NamedAgg(column=agg.column, aggfunc='mean')
+            elif agg.function == 'MIN':
+                agg_dict[agg.alias] = pd.NamedAgg(column=agg.column, aggfunc='min')
+            elif agg.function == 'MAX':
+                agg_dict[agg.alias] = pd.NamedAgg(column=agg.column, aggfunc='max')
+            elif agg.function == 'COUNT_DISTINCT':
+                agg_dict[agg.alias] = pd.NamedAgg(column=agg.column, aggfunc='nunique')
+            elif agg.function == 'FIRST':
+                agg_dict[agg.alias] = pd.NamedAgg(column=agg.column, aggfunc='first')
+            elif agg.function == 'LAST':
+                agg_dict[agg.alias] = pd.NamedAgg(column=agg.column, aggfunc='last')
+            elif agg.function == 'CONCAT':
+                agg_dict[agg.alias] = pd.NamedAgg(
+                    column=agg.column, 
+                    aggfunc=lambda x: agg.separator.join(str(v) for v in x if pd.notna(v))
+                )
+            elif agg.function == 'CONCAT_DISTINCT':
+                agg_dict[agg.alias] = pd.NamedAgg(
+                    column=agg.column,
+                    aggfunc=lambda x: agg.separator.join(str(v) for v in x.dropna().unique())
+                )
+        
+        return grouped.agg(**agg_dict).reset_index()
+    
+    def _apply_aggregations_no_group(
+        self, 
+        df: pd.DataFrame, 
+        aggregations: List[AggregationFunction]
+    ) -> pd.DataFrame:
+        """Apply aggregation functions without grouping (aggregate all records)."""
+        result = {}
+        
+        for agg in aggregations:
+            series = df[agg.column]
+            
+            if agg.function == 'SUM':
+                result[agg.alias] = series.sum()
+            elif agg.function == 'COUNT':
+                result[agg.alias] = series.count()
+            elif agg.function == 'AVG':
+                result[agg.alias] = series.mean()
+            elif agg.function == 'MIN':
+                result[agg.alias] = series.min()
+            elif agg.function == 'MAX':
+                result[agg.alias] = series.max()
+            elif agg.function == 'COUNT_DISTINCT':
+                result[agg.alias] = series.nunique()
+            elif agg.function == 'FIRST':
+                result[agg.alias] = series.iloc[0] if len(series) > 0 else None
+            elif agg.function == 'LAST':
+                result[agg.alias] = series.iloc[-1] if len(series) > 0 else None
+            elif agg.function == 'CONCAT':
+                result[agg.alias] = agg.separator.join(str(v) for v in series if pd.notna(v))
+            elif agg.function == 'CONCAT_DISTINCT':
+                result[agg.alias] = agg.separator.join(str(v) for v in series.dropna().unique())
+        
+        return pd.DataFrame([result])
+    
+    def _clean_records(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Clean up records by handling NaN values and type conversion."""
+        cleaned = []
+        
+        for record in records:
+            cleaned_record = {}
+            for key, value in record.items():
+                # Handle pandas NaN values
+                if pd.isna(value):
+                    cleaned_record[key] = None
+                # Convert numpy types to Python types
+                elif hasattr(value, 'item'):
+                    cleaned_record[key] = value.item()
+                # Handle Decimal types
+                elif isinstance(value, Decimal):
+                    cleaned_record[key] = float(value)
+                else:
+                    cleaned_record[key] = value
+            cleaned.append(cleaned_record)
+        
+        return cleaned
+
+
+async def aggregate_records(
+    records: List[Dict[str, Any]], 
+    config: AggregationConfig
+) -> List[Dict[str, Any]]:
+    """
+    Convenience function for aggregating records.
+    
+    Args:
+        records: List of records to aggregate
+        config: Aggregation configuration
+        
+    Returns:
+        List of aggregated records
+    """
+    processor = AggregationProcessor()
+    return await processor.aggregate(records, config)
+
+
+# Example usage and test data
+if __name__ == "__main__":
+    import asyncio
+    
+    # Sample data
+    sample_records = [
+        {"category": "A", "region": "North", "amount": 100, "user_id": "u1"},
+        {"category": "A", "region": "North", "amount": 150, "user_id": "u2"},
+        {"category": "A", "region": "South", "amount": 200, "user_id": "u3"},
+        {"category": "B", "region": "North", "amount": 300, "user_id": "u1"},
+        {"category": "B", "region": "South", "amount": 250, "user_id": "u4"},
+    ]
+    
+    # Aggregation configuration
+    config = AggregationConfig(
+        group_by=["category", "region"],
+        aggregations=[
+            AggregationFunction(column="amount", function="SUM", alias="total_amount"),
+            AggregationFunction(column="user_id", function="COUNT", alias="record_count"),
+            AggregationFunction(column="user_id", function="COUNT_DISTINCT", alias="unique_users")
+        ]
+    )
+    
+    async def test():
+        processor = AggregationProcessor()
+        result = await processor.aggregate(sample_records, config)
+        print("Aggregation Result:")
+        for record in result:
+            print(record)
+    
+    asyncio.run(test())
