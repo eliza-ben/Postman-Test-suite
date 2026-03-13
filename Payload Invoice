@@ -1,0 +1,64 @@
+{
+  "db": {
+    "table_name": "invoice_fee_stg",
+    "schema_name": "centrl",
+    "sqlalchemy_url": ""
+  },
+  "file": {
+    "type": "xlsx",
+    "header": true,
+    "compress": false,
+    "delimiter": ",",
+    "sheet_name": "INVOICE_HEADER",
+    "output_path": "test",
+    "filename_prefix": "invoice_header",
+    "include_correlation_id": false
+  },
+  "filters": [
+    {
+      "op": "eq",
+      "value": "02100002_202601_02-09-26_134349_SXV84",
+      "column": "correlation_id"
+    },
+    {
+      "op": "ne",
+      "value": "RELATIONSHIP SUMMARY",
+      "column": "account_description"
+    }
+  ],
+  "mapping": [
+    { "type": "string",  "source": "correlation_id", "target": "correlation_id"  },
+    { "type": "string",  "source": "invoice_dt",     "target": "invoice_date",   "format": "%d-%b-%Y" },
+    { "type": "string",  "source": "from_dt",        "target": "effective_date", "format": "%b %Y"    },
+    { "type": "string",  "source": "invoice_dt",     "target": "due_date"                             },
+    { "type": "decimal", "source": "charge_amount",  "target": "invoice_total"                        },
+    { "type": "string",  "source": "currency",       "target": "invoice_currency"                     }
+  ],
+  "aggregation_config": {
+    "group_by": [
+      "correlation_id"
+    ],
+    "aggregations": [
+      { "source": "charge_amount", "target": "invoice_total",    "function": "sum" },
+      { "source": "currency",      "target": "invoice_currency", "function": "min" },
+      { "source": "invoice_dt",    "target": "invoice_date",     "function": "min" },
+      { "source": "invoice_dt",    "target": "due_date",         "function": "min" },
+      { "source": "from_dt",       "target": "effective_date",   "function": "min" }
+    ]
+  },
+  "expression_config": {
+    "expressions": [
+      {
+        "target": "invoice_number",
+        "type": "string",
+        "expression": "'FCB-' + correlation_id"
+      },
+      {
+        "target": "due_date",
+        "type": "string",
+        "expression": "'01-' + format_date_add(invoice_date, '%d-%b-%Y', 1, 'month', '%b-%Y')"
+      }
+    ]
+  },
+  "version": "1.0"
+}
