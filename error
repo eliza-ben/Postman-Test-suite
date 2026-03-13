@@ -6,6 +6,30 @@
 
                     "expression": "date_format(addMonths(date_parse(${period}, \"%Y%m\"), 1), \"%m/%d/%Y\")"
 
+"expressions": [
+    {
+      "target_column": "invoice_number",
+      "expression": "concat('FCB-', ${correlation_id})",
+      "data_type": "string"
+    },
+    {
+      "target_column": "invoice_date",
+      "expression": "date_format(date_parse(${invoice_dt}, '%Y%m%d'), '%d-%b-%Y')",
+      "data_type": "string"
+    },
+    {
+      "target_column": "effective_date",
+      "expression": "date_format(date_parse(concat(${from_dt}, '01'), '%Y%m%d%d'), '%b %Y')",
+      "data_type": "string"
+    },
+    {
+      "target_column": "due_date",
+      "expression": "date_format(addMonths(date_parse(${invoice_dt}, '%Y%m%d'), 1), '01-%b-%Y')",
+      "data_type": "string"
+    }
+  ]
+}
+
 Caused by: tools.jackson.databind.exc.MismatchedInputException: Cannot map `null` into type `boolean` (set DeserializationConfig.DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES to 'false' to allow)
  at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); byte offset: #69] (through reference chain: org.fcb.genesis.fileintel.dto.request.FileOperationRequest["request"]->org.fcb.genesis.fileintel.dto.request.RequestMetadata["dryRun"])
 
