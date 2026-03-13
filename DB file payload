@@ -1,0 +1,75 @@
+    {  "db": {
+        "batch_size": 15000,
+        "table_name": "invoice_fee_stg",
+        "schema_name": "c",
+        "sqlalchemy_url": "",
+      },
+      "file": {
+        "type": "xlsx",
+        "header": true,
+        "compress": false,
+        "delimiter": ",",
+        "sheet_name": "SERVICE_FEE",
+        "output_path": "test",
+        "filename_prefix": "service",
+        "correlation_id_column": "correlation_id",
+        "include_correlation_id": false
+      },
+      "job_id": "fxrate-transfer-001",
+      "run_id": "{{RunId}}",
+      "filters": [
+        {
+          "op": "eq",
+          "value": "02100002_202601_02-09-26_134349_SXV84",
+          "column": "correlation_id"
+        },
+                {
+          "op": "ne",
+          "value": "RELATIONSHIP SUMMARY",
+          "column": "account_description"
+        }
+
+      ],
+      "mapping": [
+        {
+          "type": "string",
+          "source": "account_id",
+          "target": "ACCOUNT_NUMBER"
+        },
+        {
+          "type": "string",
+          "source": "service_description",
+          "target": "FEE_DESCRIPTION"
+        },
+        {
+          "type": "string",
+          "source": "charge_amount",
+          "target": "Fee Amount"
+        },
+         {
+          "type": "string",
+          "source": "currency",
+          "target": "Fee Currency"
+        },
+         
+        {
+          "type": "string",
+          "source": "currency",
+          "target": "Market"
+        },
+        {
+          "type": "string",
+          "source": "volume",
+          "target": "Transactions"
+        }
+      ],
+      "user_id": "{{UserId}}",
+      "version": "1.0",
+      "cob_date": "{{CobDate}}",
+      "job_type": "db-to-file",
+      "correlation_id": "{{CorrelationId}}",
+      "run_control_id": "{{RunControlId}}"
+
+    },
+    "job_type": "db-to-file"
+}
