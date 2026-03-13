@@ -1,3 +1,10 @@
+# ✅ ADD THIS BLOCK — Force numeric casting for SUM/AVG columns
+    for agg in config.aggregations:
+        if agg.function in ('SUM', 'AVG'):
+            df[agg.column] = pd.to_numeric(df[agg.column], errors='coerce')
+            logger.debug(f"Cast column '{agg.column}' to numeric for {agg.function}")
+
+
 Caused by: tools.jackson.databind.exc.MismatchedInputException: Cannot map `null` into type `boolean` (set DeserializationConfig.DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES to 'false' to allow)
  at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); byte offset: #69] (through reference chain: org.fcb.genesis.fileintel.dto.request.FileOperationRequest["request"]->org.fcb.genesis.fileintel.dto.request.RequestMetadata["dryRun"])
 
