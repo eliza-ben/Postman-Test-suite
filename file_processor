@@ -1,0 +1,722 @@
+"""File Processor - Reusable file I/O operations for ETL services."""
+
+import csv
+import gzip
+import json
+from typing import Any, Dict, List, Optional
+from datetime import datetime
+from pathlib import Path
+from fastapi import HTTPException
+
+
+class FileReader:
+    """Read various file formats with compression support."""
+    
+    @staticmethod
+    async def read_csv(
+        file_path: str,
+        encoding: str = "utf-8",
+        delimiter: str = ",",
+        has_header: bool = True,
+        skip_lines: int = 0,
+        skip_footer_lines: int = 0,
+        field_names: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Read CSV/TSV file with multi-character delimiter and footer skip support.
+        
+        Args:
+            file_path: Path to file
+            encoding: File encoding
+            delimiter: Field delimiter (supports multi-char like '||', '::')
+            has_header: Whether file has header row
+            skip_lines: Number of lines to skip at start (before header)
+            skip_footer_lines: Number of lines to skip at end (footer)
+            field_names: Custom field names (if no header)
+        
+        Returns:
+            List of records as dictionaries
+        """
+        records = []
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"Source file not found: {file_path}")
+        
+        # Handle gzip
+        if file_path.endswith('.gz'):
+            file_handle = gzip.open(path, 'rt', encoding=encoding)
+        else:
+            file_handle = open(path, 'r', encoding=encoding)
+        
+        try:
+            # Read all lines for skip_lines and skip_footer_lines support
+            all_lines = file_handle.readlines()
+            
+            # Skip header lines (before actual header row)
+            if skip_lines > 0:
+                all_lines = all_lines[skip_lines:]
+            
+            # Skip footer lines
+            if skip_footer_lines > 0:
+                all_lines = all_lines[:-skip_footer_lines]
+            
+            if not all_lines:
+                return records
+            
+            # Check if delimiter is multi-character (csv module only supports single char)
+            if len(delimiter) > 1:
+                # Multi-character delimiter: manual parsing
+                if has_header:
+                    header_line = all_lines[0].rstrip('\r\n')
+                    headers = header_line.split(delimiter)
+                    data_lines = all_lines[1:]
+                elif field_names:
+                    headers = field_names
+                    data_lines = all_lines
+                else:
+                    first_line = all_lines[0].rstrip('\r\n')
+                    num_cols = len(first_line.split(delimiter))
+                    headers = [f"col_{i}" for i in range(num_cols)]
+                    data_lines = all_lines
+                
+                for line in data_lines:
+                    line = line.rstrip('\r\n')
+                    if not line:
+                        continue
+                    values = line.split(delimiter)
+                    record = {headers[i]: values[i] if i < len(values) else '' for i in range(len(headers))}
+                    records.append(record)
+            else:
+                # Single-character delimiter: use csv module
+                import io
+                remaining_content = ''.join(all_lines)
+                text_stream = io.StringIO(remaining_content)
+                
+                reader = csv.DictReader(
+                    text_stream,
+                    delimiter=delimiter,
+                    fieldnames=field_names if not has_header else None
+                )
+                
+                for row in reader:
+                    records.append(dict(row))
+        
+        finally:
+            file_handle.close()
+        
+        return records
+    
+    @staticmethod
+    async def read_json(
+        file_path: str,
+        encoding: str = "utf-8",
+        skip_lines: int = 0,
+        records_pointer: Optional[str] = "$",
+    ) -> List[Dict[str, Any]]:
+        """
+        Read JSON file with optional JSONPath extraction.
+        
+        Preserves exact logic from file-to-file service.
+        
+        Args:
+            file_path: Path to file
+            encoding: File encoding
+            skip_lines: Number of lines to skip
+            records_pointer: JSONPath to extract records
+        
+        Returns:
+            List of records
+        """
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"Source file not found: {file_path}")
+        
+        if file_path.endswith('.gz'):
+            file_handle = gzip.open(path, 'rt', encoding=encoding)
+        else:
+            file_handle = open(path, 'r', encoding=encoding)
+        
+        try:
+            # Skip lines
+            for _ in range(skip_lines):
+                next(file_handle)
+            
+            data = json.load(file_handle)
+            
+            # Extract records using JSONPath if needed
+            if records_pointer and records_pointer != "$":
+                import jsonpath_ng
+                path_expr = jsonpath_ng.parse(records_pointer)
+                matches = path_expr.find(data)
+                if matches:
+                    data = matches[0].value
+            
+            if isinstance(data, list):
+                return data
+            else:
+                return [data]
+        
+        finally:
+            file_handle.close()
+    
+    @staticmethod
+    async def read_jsonl(
+        file_path: str,
+        encoding: str = "utf-8",
+        skip_lines: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Read JSON Lines file.
+        
+        Preserves exact logic from file-to-file service.
+        
+        Args:
+            file_path: Path to file
+            encoding: File encoding
+            skip_lines: Number of lines to skip
+        
+        Returns:
+            List of records
+        """
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"Source file not found: {file_path}")
+        
+        if file_path.endswith('.gz'):
+            file_handle = gzip.open(path, 'rt', encoding=encoding)
+        else:
+            file_handle = open(path, 'r', encoding=encoding)
+        
+        try:
+            # Skip lines
+            for _ in range(skip_lines):
+                next(file_handle)
+            
+            records = []
+            for line in file_handle:
+                if line.strip():
+                    records.append(json.loads(line))
+            return records
+        
+        finally:
+            file_handle.close()
+    
+    @staticmethod
+    async def read_fixed_width(
+        file_path: str,
+        field_widths: List[int],
+        field_names: List[str],
+        encoding: str = "utf-8",
+        has_header: bool = True,
+        skip_lines: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Read fixed-width file.
+        
+        Preserves exact logic from file-to-file service.
+        
+        Args:
+            file_path: Path to file
+            field_widths: Width of each field
+            field_names: Name of each field
+            encoding: File encoding
+            has_header: Whether file has header
+            skip_lines: Number of lines to skip
+        
+        Returns:
+            List of records
+        """
+        if not field_widths or not field_names:
+            raise HTTPException(
+                status_code=400,
+                detail="field_widths and field_names required for fixed-width files"
+            )
+        
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"Source file not found: {file_path}")
+        
+        if file_path.endswith('.gz'):
+            file_handle = gzip.open(path, 'rt', encoding=encoding)
+        else:
+            file_handle = open(path, 'r', encoding=encoding)
+        
+        try:
+            # Skip lines
+            for _ in range(skip_lines):
+                next(file_handle)
+            
+            # Skip header if present
+            if has_header:
+                next(file_handle)
+            
+            records = []
+            for line in file_handle:
+                record = {}
+                pos = 0
+                for i, width in enumerate(field_widths):
+                    field_name = field_names[i]
+                    value = line[pos:pos+width].strip()
+                    record[field_name] = value
+                    pos += width
+                records.append(record)
+            
+            return records
+        
+        finally:
+            file_handle.close()
+    
+    @staticmethod
+    async def read_excel(
+        file_path: str,
+        sheet_name: Optional[str] = None,
+        has_header: bool = True,
+        skip_lines: int = 0,
+        field_names: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Read Excel file (.xlsx or .xls format).
+        
+        Args:
+            file_path: Path to Excel file
+            sheet_name: Name of sheet to read (default: first sheet)
+            has_header: Whether first row is header
+            skip_lines: Number of rows to skip at start
+            field_names: Custom field names (if no header)
+        
+        Returns:
+            List of records as dictionaries
+        """
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="Excel support requires openpyxl. Install with: pip install openpyxl"
+            )
+        
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"Source file not found: {file_path}")
+        
+        wb = load_workbook(filename=str(path), read_only=True, data_only=True)
+        
+        # Get the worksheet
+        if sheet_name:
+            if sheet_name not in wb.sheetnames:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Sheet '{sheet_name}' not found. Available: {wb.sheetnames}"
+                )
+            ws = wb[sheet_name]
+        else:
+            ws = wb.active
+        
+        records = []
+        rows = list(ws.iter_rows(values_only=True))
+        
+        # Skip lines
+        rows = rows[skip_lines:]
+        
+        if not rows:
+            wb.close()
+            return records
+        
+        # Determine field names
+        if has_header:
+            headers = [str(cell) if cell is not None else f"col_{i}" for i, cell in enumerate(rows[0])]
+            data_rows = rows[1:]
+        elif field_names:
+            headers = field_names
+            data_rows = rows
+        else:
+            headers = [f"col_{i}" for i in range(len(rows[0]))]
+            data_rows = rows
+        
+        # Build records
+        for row in data_rows:
+            record = {}
+            for i, value in enumerate(row):
+                if i < len(headers):
+                    record[headers[i]] = value
+            records.append(record)
+        
+        wb.close()
+        return records
+
+
+class FileWriter:
+    """Write various file formats with compression support."""
+    
+    @staticmethod
+    async def write_csv(
+        records: List[Dict[str, Any]],
+        file_path: str,
+        field_names: List[str],
+        encoding: str = "utf-8",
+        delimiter: str = ",",
+        quotechar: str = '"',
+        header: bool = True,
+        compress: bool = False,
+    ) -> str:
+        """
+        Write CSV/TSV file with multi-character delimiter support.
+        
+        Args:
+            records: List of records to write
+            file_path: Output file path
+            field_names: Field names for columns
+            encoding: File encoding
+            delimiter: Field delimiter (supports multi-char like '||', '::')
+            quotechar: Quote character
+            header: Include header row
+            compress: Use gzip compression
+        
+        Returns:
+            Path to written file
+        """
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        if compress:
+            file_handle = gzip.open(path, 'wt', encoding=encoding)
+        else:
+            file_handle = open(path, 'w', encoding=encoding, newline='')
+        
+        try:
+            # Check if delimiter is multi-character (csv module only supports single char)
+            if len(delimiter) > 1:
+                # Multi-character delimiter: manual writing
+                if header:
+                    file_handle.write(delimiter.join(field_names) + '\n')
+                
+                for record in records:
+                    values = [str(record.get(field, '')) if record.get(field) is not None else '' for field in field_names]
+                    file_handle.write(delimiter.join(values) + '\n')
+            else:
+                # Single-character delimiter: use csv module
+                writer = csv.DictWriter(
+                    file_handle,
+                    fieldnames=field_names,
+                    delimiter=delimiter,
+                    quotechar=quotechar,
+                    extrasaction='ignore',
+                    quoting=csv.QUOTE_MINIMAL,
+                )
+                
+                if header:
+                    writer.writeheader()
+                
+                writer.writerows(records)
+        
+        finally:
+            file_handle.close()
+        
+        return str(path)
+    
+    @staticmethod
+    async def write_json(
+        records: List[Dict[str, Any]],
+        file_path: str,
+        encoding: str = "utf-8",
+        pretty: bool = False,
+        compress: bool = False,
+    ) -> str:
+        """
+        Write JSON file.
+        
+        Preserves exact logic from file-to-file service.
+        
+        Args:
+            records: List of records to write
+            file_path: Output file path
+            encoding: File encoding
+            pretty: Pretty print JSON
+            compress: Use gzip compression
+        
+        Returns:
+            Path to written file
+        """
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        if compress:
+            file_handle = gzip.open(path, 'wt', encoding=encoding)
+        else:
+            file_handle = open(path, 'w', encoding=encoding)
+        
+        try:
+            if pretty:
+                json.dump(records, file_handle, indent=2)
+            else:
+                json.dump(records, file_handle)
+        
+        finally:
+            file_handle.close()
+        
+        return str(path)
+    
+    @staticmethod
+    async def write_jsonl(
+        records: List[Dict[str, Any]],
+        file_path: str,
+        encoding: str = "utf-8",
+        compress: bool = False,
+    ) -> str:
+        """
+        Write JSON Lines file.
+        
+        Preserves exact logic from file-to-file service.
+        
+        Args:
+            records: List of records to write
+            file_path: Output file path
+            encoding: File encoding
+            compress: Use gzip compression
+        
+        Returns:
+            Path to written file
+        """
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        if compress:
+            file_handle = gzip.open(path, 'wt', encoding=encoding)
+        else:
+            file_handle = open(path, 'w', encoding=encoding)
+        
+        try:
+            for record in records:
+                file_handle.write(json.dumps(record) + '\n')
+        
+        finally:
+            file_handle.close()
+        
+        return str(path)
+    
+    @staticmethod
+    async def write_fixed_width(
+        records: List[Dict[str, Any]],
+        file_path: str,
+        field_names: List[str],
+        field_widths: List[int],
+        encoding: str = "utf-8",
+        align: str = "left",
+        pad_char: str = " ",
+        strict_width: bool = False,
+        header: bool = True,
+        compress: bool = False,
+    ) -> str:
+        """
+        Write fixed-width file.
+        
+        Preserves exact logic from file-to-file and db-to-file services.
+        
+        Args:
+            records: List of records to write
+            file_path: Output file path
+            field_names: Field names
+            field_widths: Width of each field
+            encoding: File encoding
+            align: Alignment (left, right, center)
+            pad_char: Padding character
+            strict_width: Truncate if value exceeds width
+            header: Include header row
+            compress: Use gzip compression
+        
+        Returns:
+            Path to written file
+        """
+        if not field_widths:
+            raise HTTPException(
+                status_code=400,
+                detail="field_widths required for fixed-width output"
+            )
+        
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        if compress:
+            file_handle = gzip.open(path, 'wt', encoding=encoding)
+        else:
+            file_handle = open(path, 'w', encoding=encoding)
+        
+        try:
+            # Write header if requested
+            if header:
+                header_parts = []
+                for i, name in enumerate(field_names):
+                    width = field_widths[i]
+                    if align == "right":
+                        header_parts.append(name.rjust(width, pad_char))
+                    elif align == "center":
+                        header_parts.append(name.center(width, pad_char))
+                    else:
+                        header_parts.append(name.ljust(width, pad_char))
+                file_handle.write(''.join(header_parts) + '\n')
+            
+            # Write records
+            for record in records:
+                line_parts = []
+                for i, name in enumerate(field_names):
+                    value = str(record.get(name, ''))
+                    width = field_widths[i]
+                    
+                    # Truncate if strict
+                    if strict_width and len(value) > width:
+                        value = value[:width]
+                    
+                    # Align and pad
+                    if align == "right":
+                        line_parts.append(value.rjust(width, pad_char))
+                    elif align == "center":
+                        line_parts.append(value.center(width, pad_char))
+                    else:
+                        line_parts.append(value.ljust(width, pad_char))
+                
+                file_handle.write(''.join(line_parts) + '\n')
+        
+        finally:
+            file_handle.close()
+        
+        return str(path)
+    
+    @staticmethod
+    async def write_excel(
+        records: List[Dict[str, Any]],
+        file_path: str,
+        field_names: List[str],
+        sheet_name: str = "Sheet1",
+        header: bool = True,
+    ) -> str:
+        """
+        Write Excel file (.xlsx format).
+        
+        Args:
+            records: List of records to write
+            file_path: Output file path
+            field_names: Field names for columns
+            sheet_name: Name of the worksheet
+            header: Include header row
+        
+        Returns:
+            Path to written file
+        """
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="Excel support requires openpyxl. Install with: pip install openpyxl"
+            )
+        
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = sheet_name
+        
+        # Write header if requested
+        if header:
+            for col_idx, name in enumerate(field_names, 1):
+                ws.cell(row=1, column=col_idx, value=name)
+            start_row = 2
+        else:
+            start_row = 1
+        
+        # Write records
+        for row_idx, record in enumerate(records, start_row):
+            for col_idx, name in enumerate(field_names, 1):
+                value = record.get(name)
+                ws.cell(row=row_idx, column=col_idx, value=value)
+        
+        wb.save(str(path))
+        
+        return str(path)
+
+
+class ValueFormatter:
+    """Format values for output (dates, decimals, etc.)."""
+    
+    @staticmethod
+    def format_value(value: Any, value_type: str, format_str: Optional[str] = None) -> str:
+        """
+        Format value according to type and format string.
+        
+        Preserves exact logic from db-to-file service.
+        
+        Args:
+            value: Value to format
+            value_type: Type (date, datetime, decimal, int, float, string)
+            format_str: Optional format string
+        
+        Returns:
+            Formatted string value
+        """
+        if value is None:
+            return ""
+        
+        if value_type == "date":
+            if isinstance(value, datetime):
+                fmt = format_str or "%Y-%m-%d"
+                return value.strftime(fmt)
+            return str(value)
+        
+        elif value_type == "datetime":
+            if isinstance(value, datetime):
+                fmt = format_str or "%Y-%m-%d %H:%M:%S"
+                return value.strftime(fmt)
+            return str(value)
+        
+        elif value_type == "decimal":
+            if format_str and format_str.startswith("scale="):
+                scale = int(format_str.split("=")[1])
+                return f"{float(value):.{scale}f}"
+            return str(value)
+        
+        elif value_type in ("int", "float"):
+            return str(value)
+        
+        else:  # string
+            return str(value)
+    
+    @staticmethod
+    def format_fixed_width(
+        value: str,
+        width: int,
+        align: str = "left",
+        pad_char: str = " ",
+        strict: bool = False,
+    ) -> str:
+        """
+        Format value for fixed-width output.
+        
+        Preserves exact logic from db-to-file service.
+        
+        Args:
+            value: Value to format
+            width: Target width
+            align: Alignment (left, right, center)
+            pad_char: Padding character
+            strict: Truncate if value exceeds width
+        
+        Returns:
+            Formatted fixed-width string
+        """
+        # Truncate if too long and strict mode
+        if strict and len(value) > width:
+            value = value[:width]
+        
+        # Pad to width
+        if align == "right":
+            return value.rjust(width, pad_char)
+        elif align == "center":
+            return value.center(width, pad_char)
+        else:  # left
+            return value.ljust(width, pad_char)
