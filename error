@@ -4,7 +4,14 @@
             df[agg.column] = pd.to_numeric(df[agg.column], errors='coerce')
             logger.debug(f"Cast column '{agg.column}' to numeric for {agg.function}")
 
-                    "expression": "date_format(addMonths(date_parse(${period}, \"%Y%m\"), 1), \"%m/%d/%Y\")"
+      
+
+
+cols_to_keep = [c for c in result_df.columns if not str(c).isdigit() and c not in ('index', 'level_0', 'level_1')]
+result_df = result_df[cols_to_keep]
+
+
+"expression": "date_format(addMonths(date_parse(${period}, \"%Y%m\"), 1), \"%m/%d/%Y\")"
 
 "expressions": [
     {
