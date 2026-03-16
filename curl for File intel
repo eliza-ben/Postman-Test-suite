@@ -1,0 +1,32 @@
+curl --location 'https://genesis-orchestrator.apps.dv-p.ocp.fcbint.net/jobs' \
+--header 'Content-Type: application/json' \
+--header 'Authorization: Basic YWRtaW46YWRtaW4xMjM=' \
+--header 'Cookie: ac4892335d37de4ae03d405c2ec0f447=1493add010fa139b54148c952696753b; ac4892335d37de4ae03d405c2ec0f447=ad04d54e5b3a957f2eef41cf4af70a78' \
+--data '{
+  "job_type": "file-intel-service",
+  "job_id": "test-file-intel-service",
+  "payload": {
+            "user_id": "{{UserId}}",
+        "cob_date": "{{CobDate}}",
+        "correlation_id": "{{CorrelationId}}",
+        "run_control_id": "{{RunControlId}}",
+        "run_id": "{{RunId}}",
+
+   
+    "request": { "correlationId": "inspect-001", "failFast": true },
+    "file": { "path": "filegenerator/InvoiceGenericFormat.xlsx", "baseDirKey": "DATA_IN" },
+    "actions": [
+      {
+        "type": "INSPECT",
+        "options": {
+          "includeMimeType": true,
+          "includeCharLength": true,
+          "textEncoding": "UTF-8",
+          "charLengthMode": "STRICT",
+          "includeLineCount": true
+        }
+      }
+    ]
+  
+}
+}'
