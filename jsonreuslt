@@ -1,0 +1,52 @@
+{
+    "job_id": "test-file-intel-service",
+    "job_type": "file-intel-service",
+    "status": "COMPLETED",
+    "result": {
+        "requestId": "437197a4-4a01-4063-87a6-f0886c378b25",
+        "timestamp": 1773694635.2418,
+        "success": true,
+        "correlationId": "inspect-001",
+        "results": {
+            "inputFile": {
+                "path": "filegenerator/InvoiceGenericFormat.xlsx",
+                "normalizedPath": "/files/filegenerator/InvoiceGenericFormat.xlsx"
+            },
+            "actions": [
+                {
+                    "type": "INSPECT",
+                    "success": true,
+                    "data": {
+                        "exists": true,
+                        "normalizedPath": "/files/filegenerator/InvoiceGenericFormat.xlsx",
+                        "sizeBytes": 17147,
+                        "byteLength": 17147,
+                        "contentMd5": "WZyiSZn0AyTvmW0nz/LQWA==",
+                        "lastModifiedEpochMs": 1773413606058,
+                        "extension": "xlsx",
+                        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        "permissions": {
+                            "readable": true,
+                            "writable": true,
+                            "executable": false
+                        },
+                        "charLength": 16426,
+                        "charLengthComputed": true,
+                        "charLengthReason": null,
+                        "lineCount": 82,
+                        "invalidSequenceCount": 0,
+                        "file": true,
+                        "directory": false
+                    },
+                    "errorMessage": null,
+                    "errorCode": null
+                }
+            ]
+        },
+        "error": null
+    },
+    "error": null,
+    "duration_ms": 466,
+    "started_at": "2026-03-16T20:57:14.784153",
+    "completed_at": "2026-03-16T20:57:15.250846"
+}
