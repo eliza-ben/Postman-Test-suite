@@ -1,3 +1,38 @@
+// Parse the response
+const response = pm.response.json();
+
+// Extract contentMd5
+const contentMd5 = response.result.results.actions[0].data.contentMd5;
+
+// Extract other useful fields
+const sizeBytes = response.result.results.actions[0].data.sizeBytes;
+const mimeType = response.result.results.actions[0].data.mimeType;
+const lineCount = response.result.results.actions[0].data.lineCount;
+const normalizedPath = response.result.results.actions[0].data.normalizedPath;
+const status = response.status;
+
+// Save to Postman environment variables
+pm.environment.set("contentMd5", contentMd5);
+pm.environment.set("sizeBytes", sizeBytes);
+pm.environment.set("mimeType", mimeType);
+pm.environment.set("lineCount", lineCount);
+pm.environment.set("normalizedPath", normalizedPath);
+pm.environment.set("jobStatus", status);
+
+// Log to console
+console.log("contentMd5:", contentMd5);
+console.log("status:", status);
+console.log("sizeBytes:", sizeBytes);
+
+// Verify job completed successfully
+pm.test("Job completed successfully", () => {
+    pm.expect(response.status).to.equal("COMPLETED");
+    pm.expect(response.result.success).to.be.true;
+    pm.expect(contentMd5).to.not.be.undefined;
+});
+
+
+
 {
     "job_id": "test-file-intel-service",
     "job_type": "file-intel-service",
