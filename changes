@@ -1,0 +1,51 @@
+if (magic != HEADER_MAGIC) {
+    // Legacy Encrypt_AESGCM format: raw 12-byte IV at start
+    byte[] iv = new byte[12];
+    iv[0] = (byte)(magic >> 24);
+    iv[1] = (byte)(magic >> 16);
+    iv[2] = (byte)(magic >> 8);
+    iv[3] = (byte)(magic);
+    dis.readFully(iv, 4, 8);
+
+    EncryptionMetadata metadata = new EncryptionMetadata();
+    metadata.ivBase64 = Base64.getEncoder().encodeToString(iv);
+    metadata.hasEmbeddedHeader = false; // ← skip header step in decrypt()
+    return metadata;
+}
+
+
+
+
+// REPLACE this:
+try (CipherInputStream cis = new CipherInputStream(is, cipher)) {
+    byte[] buffer = new byte[bufferSize];
+    int read;
+    while ((read = cis.read(buffer)) != -1) {
+        os.write(buffer, 0, read);
+    }
+}
+
+// WITH this (doFinal gives you proper auth tag verification):
+if (metadata.hasEmbeddedHeader) {
+    skipHeader(is);
+}
+byte[] ciphertext = is.readAllBytes();
+byte[] plaintext = cipher.doFinal(ciphertext);  // throws AEADBadTagException on bad key
+os.write(plaintext);
+```
+
+> **Why:** `CipherInputStream` with AES/GCM is known to silently return garbage or no data instead of throwing on auth tag failure. `cipher.doFinal()` is the safe path.
+
+---
+
+### 3. `skipHeader()` — guard is already correct, nothing to change
+
+`decrypt()` only calls `skipHeader(is)` when `metadata.hasEmbeddedHeader` is true, so legacy files naturally skip it. No change needed there — just don't move that call outside the `if` block.
+
+---
+
+### At a glance
+```
+readMetadata()   ← add legacy fallback branch
+decrypt()        ← swap CipherInputStream loop → cipher.doFinal()
+skipHeader()     ← no change needed
