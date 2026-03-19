@@ -1,0 +1,305 @@
+package org.fcb.genesis.fileintel.service;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import org.fcb.genesis.fileintel.config.AppProperties;
+import org.fcb.genesis.fileintel.dto.enums.ActionType;
+import org.fcb.genesis.fileintel.dto.enums.ErrorCode;
+import org.fcb.genesis.fileintel.dto.request.ActionOptions;
+import org.fcb.genesis.fileintel.dto.request.ActionSpec;
+import org.fcb.genesis.fileintel.dto.request.FileOperationRequest;
+import org.fcb.genesis.fileintel.dto.response.ActionResult;
+import org.fcb.genesis.fileintel.dto.response.ChecksumData;
+import org.fcb.genesis.fileintel.dto.response.DecryptData;
+import org.fcb.genesis.fileintel.dto.response.EncryptData;
+import org.fcb.genesis.fileintel.dto.response.ErrorInfo;
+import org.fcb.genesis.fileintel.dto.response.FileOperationResponse;
+import org.fcb.genesis.fileintel.dto.response.InputFileInfo;
+import org.fcb.genesis.fileintel.dto.response.InspectData;
+import org.fcb.genesis.fileintel.dto.response.OperationResults;
+import org.fcb.genesis.fileintel.exception.FileIntelException;
+import org.fcb.genesis.fileintel.filter.RequestIdFilter;
+import org.slf4j.MDC;
+import org.springframework.stereotype.Service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * Main orchestration service for file operations.
+ * Executes actions in sequence and supports chaining.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class FileOperationService {
+
+    private final PathSecurityService pathSecurityService;
+    private final FileInspectService fileInspectService;
+    private final ChecksumService checksumService;
+    private final CryptoService cryptoService;
+    private final AppProperties appProperties;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    /**
+     * Executes all actions in the request sequentially.
+     */
+    public FileOperationResponse executeOperations(FileOperationRequest request) {
+        String requestId = MDC.get(RequestIdFilter.REQUEST_ID_MDC_KEY);
+        if (requestId == null) {
+            requestId = UUID.randomUUID().toString();
+        }
+
+        String correlationId = request.getRequest().getCorrelationId();
+        if (correlationId != null) {
+            MDC.put(RequestIdFilter.CORRELATION_ID_MDC_KEY, correlationId);
+        }
+
+        log.info("Processing file operation request with {} actions", request.getActions().size());
+
+        // Resolve and validate input path
+        Path currentPath = pathSecurityService.resolvePath(
+                request.getFile().getBaseDirKey(),
+                request.getFile().getPath());
+
+        List<ActionResult> actionResults = new ArrayList<>();
+        boolean overallSuccess = true;
+        ErrorInfo errorInfo = null;
+
+        for (int i = 0; i < request.getActions().size(); i++) {
+            ActionSpec action = request.getActions().get(i);
+            log.debug("Executing action {} of {}: {}", i + 1, request.getActions().size(), action.getType());
+
+            try {
+                ActionResult result = executeAction(action, currentPath, request.getRequest().isDryRun(), i);
+                actionResults.add(result);
+
+                if (!result.isSuccess()) {
+                    overallSuccess = false;
+                    errorInfo = ErrorInfo.builder()
+                            .code(ErrorCode.valueOf(result.getErrorCode()))
+                            .message(result.getErrorMessage())
+                            .failedActionIndex(i)
+                            .failedActionType(action.getType())
+                            .build();
+
+                    if (request.getRequest().isFailFast()) {
+                        log.warn("Action {} failed, stopping due to failFast=true", action.getType());
+                        break;
+                    }
+                } else {
+                    // Handle useOutputAsNextInput for chaining
+                    if (action.getOptions() != null && action.getOptions().isUseOutputAsNextInput()) {
+                        Path outputPath = extractOutputPath(result, action.getType());
+                        if (outputPath != null) {
+                            currentPath = outputPath;
+                            log.debug("Chaining: using output {} as next input", currentPath);
+                        }
+                    }
+                }
+
+            } catch (FileIntelException e) {
+                log.error("Action {} failed: {}", action.getType(), e.getMessage());
+                actionResults.add(ActionResult.builder()
+                        .type(action.getType())
+                        .success(false)
+                        .errorCode(e.getErrorCode().name())
+                        .errorMessage(e.getMessage())
+                        .build());
+
+                overallSuccess = false;
+                errorInfo = ErrorInfo.builder()
+                        .code(e.getErrorCode())
+                        .message(e.getMessage())
+                        .failedActionIndex(i)
+                        .failedActionType(action.getType())
+                        .details(e.getDetails())
+                        .build();
+
+                if (request.getRequest().isFailFast()) {
+                    break;
+                }
+
+            } catch (Exception e) {
+                log.error("Unexpected error in action {}: {}", action.getType(), e.getMessage(), e);
+                actionResults.add(ActionResult.builder()
+                        .type(action.getType())
+                        .success(false)
+                        .errorCode(ErrorCode.INTERNAL_ERROR.name())
+                        .errorMessage("Unexpected error: " + e.getMessage())
+                        .build());
+
+                overallSuccess = false;
+                errorInfo = ErrorInfo.builder()
+                        .code(ErrorCode.INTERNAL_ERROR)
+                        .message("Unexpected error: " + e.getMessage())
+                        .failedActionIndex(i)
+                        .failedActionType(action.getType())
+                        .details(e.getClass().getSimpleName())
+                        .build();
+
+                if (request.getRequest().isFailFast()) {
+                    break;
+                }
+            }
+        }
+
+        return FileOperationResponse.builder()
+                .requestId(requestId)
+                .timestamp(Instant.now())
+                .success(overallSuccess)
+                .correlationId(correlationId)
+                .results(OperationResults.builder()
+                        .inputFile(InputFileInfo.builder()
+                                .path(request.getFile().getPath())
+                                .normalizedPath(pathSecurityService.resolvePath(
+                                        request.getFile().getBaseDirKey(),
+                                        request.getFile().getPath()).toString())
+                                .build())
+                        .actions(actionResults)
+                        .build())
+                .error(overallSuccess ? null : errorInfo)
+                .build();
+    }
+
+    private ActionResult executeAction(ActionSpec action, Path inputPath, boolean dryRun, int actionIndex) 
+            throws IOException {
+        
+        ActionOptions options = action.getOptions() != null ? action.getOptions() : new ActionOptions();
+
+        return switch (action.getType()) {
+            case INSPECT -> executeInspect(inputPath, options);
+            case CHECKSUM -> executeChecksum(inputPath, options, actionIndex);
+            case ENCRYPT -> executeEncrypt(inputPath, options, action, dryRun, actionIndex);
+            case DECRYPT -> executeDecrypt(inputPath, options, action, dryRun, actionIndex);
+        };
+    }
+
+    private ActionResult executeInspect(Path path, ActionOptions options) throws IOException {
+        InspectData data = fileInspectService.inspect(path, options);
+        
+        Map<String, Object> dataMap = objectMapper.convertValue(data, Map.class);
+        
+        return ActionResult.builder()
+                .type(ActionType.INSPECT)
+                .success(true)
+                .data(dataMap)
+                .build();
+    }
+
+    private ActionResult executeChecksum(Path path, ActionOptions options, int actionIndex) throws IOException {
+        // Validate file exists and size
+        pathSecurityService.validateFileExists(path);
+        pathSecurityService.validateIsFile(path);
+        pathSecurityService.validateFileSize(path, appProperties.getLimits().getMaxFileBytes(), "checksum");
+
+        ChecksumData data = checksumService.calculateChecksum(path, options);
+        
+        Map<String, Object> dataMap = objectMapper.convertValue(data, Map.class);
+        
+        return ActionResult.builder()
+                .type(ActionType.CHECKSUM)
+                .success(true)
+                .data(dataMap)
+                .build();
+    }
+
+    private ActionResult executeEncrypt(Path inputPath, ActionOptions options, ActionSpec action,
+            boolean dryRun, int actionIndex) throws IOException {
+
+        // Validate source file
+        pathSecurityService.validateFileExists(inputPath);
+        pathSecurityService.validateIsFile(inputPath);
+        pathSecurityService.validateFileSize(inputPath, appProperties.getLimits().getMaxFileBytes(), "encryption");
+
+        // Resolve target path
+        if (options.getTargetPath() == null || options.getTargetPath().isBlank()) {
+            throw new FileIntelException(ErrorCode.INVALID_REQUEST, 
+                "Target path is required for encryption", actionIndex, ActionType.ENCRYPT);
+        }
+
+        String targetBaseDirKey = options.getTargetBaseDirKey() != null ? 
+                options.getTargetBaseDirKey() : "DATA_OUT";
+        Path targetPath = pathSecurityService.resolvePath(targetBaseDirKey, options.getTargetPath());
+
+        // Validate target
+        pathSecurityService.validateTargetPath(targetPath, options.isOverwriteTarget());
+        
+        if (!dryRun) {
+            pathSecurityService.ensureParentDirectories(targetPath);
+        }
+
+        EncryptData data = cryptoService.encrypt(inputPath, targetPath, options, action.getKeyMaterial(), dryRun);
+        
+        Map<String, Object> dataMap = objectMapper.convertValue(data, Map.class);
+        
+        return ActionResult.builder()
+                .type(ActionType.ENCRYPT)
+                .success(true)
+                .data(dataMap)
+                .build();
+    }
+
+    private ActionResult executeDecrypt(Path inputPath, ActionOptions options, ActionSpec action,
+            boolean dryRun, int actionIndex) throws IOException {
+
+        // Validate source file
+        pathSecurityService.validateFileExists(inputPath);
+        pathSecurityService.validateIsFile(inputPath);
+        pathSecurityService.validateFileSize(inputPath, appProperties.getLimits().getMaxFileBytes(), "decryption");
+
+        // Resolve target path
+        if (options.getTargetPath() == null || options.getTargetPath().isBlank()) {
+            throw new FileIntelException(ErrorCode.INVALID_REQUEST, 
+                "Target path is required for decryption", actionIndex, ActionType.DECRYPT);
+        }
+
+        String targetBaseDirKey = options.getTargetBaseDirKey() != null ? 
+                options.getTargetBaseDirKey() : "DATA_OUT";
+        Path targetPath = pathSecurityService.resolvePath(targetBaseDirKey, options.getTargetPath());
+
+        // Validate target
+        pathSecurityService.validateTargetPath(targetPath, options.isOverwriteTarget());
+        
+        if (!dryRun) {
+            pathSecurityService.ensureParentDirectories(targetPath);
+        }
+
+        DecryptData data = cryptoService.decrypt(inputPath, targetPath, options, action.getKeyMaterial(), dryRun);
+        
+        Map<String, Object> dataMap = objectMapper.convertValue(data, Map.class);
+        
+        return ActionResult.builder()
+                .type(ActionType.DECRYPT)
+                .success(true)
+                .data(dataMap)
+                .build();
+    }
+
+    private Path extractOutputPath(ActionResult result, ActionType actionType) {
+        if (result.getData() == null) {
+            return null;
+        }
+
+        String pathKey = switch (actionType) {
+            case ENCRYPT, DECRYPT -> "targetPath";
+            default -> null;
+        };
+
+        if (pathKey != null && result.getData().containsKey(pathKey)) {
+            Object pathValue = result.getData().get(pathKey);
+            if (pathValue instanceof String) {
+                return Path.of((String) pathValue);
+            }
+        }
+        return null;
+    }
+}
