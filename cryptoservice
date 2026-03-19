@@ -1,0 +1,421 @@
+package org.fcb.genesis.fileintel.service;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.SecureRandom;
+import java.util.Base64;
+
+import javax.crypto.AEADBadTagException;
+import javax.crypto.Cipher;
+import javax.crypto.CipherInputStream;
+import javax.crypto.CipherOutputStream;
+import javax.crypto.SecretKey;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
+
+import org.fcb.genesis.fileintel.config.AppProperties;
+import org.fcb.genesis.fileintel.dto.enums.ErrorCode;
+import org.fcb.genesis.fileintel.dto.enums.KeyMode;
+import org.fcb.genesis.fileintel.dto.enums.MetadataOutput;
+import org.fcb.genesis.fileintel.dto.request.ActionOptions;
+import org.fcb.genesis.fileintel.dto.request.KeyMaterial;
+import org.fcb.genesis.fileintel.dto.response.DecryptData;
+import org.fcb.genesis.fileintel.dto.response.EncryptData;
+import org.fcb.genesis.fileintel.exception.FileIntelException;
+import org.springframework.stereotype.Service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import lombok.Data;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * Service for AES-256-GCM encryption and decryption with streaming I/O.
+ * Supports both raw key and passphrase-based key derivation (PBKDF2).
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class CryptoService {
+
+    private static final int HEADER_MAGIC = 0x4E464543; // "NFEC" - NovaFlow Encrypted Content
+    private static final short HEADER_VERSION = 1;
+
+    private final AppProperties appProperties;
+    private final ChecksumService checksumService;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final SecureRandom secureRandom = new SecureRandom();
+
+    /**
+     * Encrypts a file using AES-256-GCM.
+     */
+    public EncryptData encrypt(Path sourcePath, Path targetPath, ActionOptions options, 
+            KeyMaterial keyMaterial, boolean dryRun) throws IOException {
+
+        validateKeyMaterial(keyMaterial);
+
+        AppProperties.EncryptionProperties encProps = appProperties.getEncryption();
+        MetadataOutput metadataOutput = options != null && options.getMetadataOutput() != null ?
+                options.getMetadataOutput() : MetadataOutput.EMBED_HEADER;
+        boolean emitChecksums = options != null && options.isEmitChecksums();
+
+        // Generate IV
+        byte[] iv = new byte[encProps.getIvLength()];
+        secureRandom.nextBytes(iv);
+
+        // Derive key
+        KeyDerivationResult keyResult = deriveKey(keyMaterial);
+        SecretKey secretKey = keyResult.key;
+
+        // Calculate plaintext checksum if requested
+        String plaintextChecksum = null;
+        if (emitChecksums) {
+            plaintextChecksum = checksumService.calculateChecksumHex(sourcePath, "SHA-256");
+        }
+
+        if (dryRun) {
+            return EncryptData.builder()
+                    .targetPath(targetPath.toString())
+                    .algorithm(encProps.getAlgorithm())
+                    .ivBase64(Base64.getEncoder().encodeToString(iv))
+                    .authTagBits(encProps.getAuthTagBits())
+                    .plaintextChecksum(plaintextChecksum)
+                    .saltBase64(keyResult.saltBase64)
+                    .pbkdf2Iterations(keyResult.iterations)
+                    .metadataOutput(metadataOutput.name())
+                    .build();
+        }
+
+        // Create temp file for atomic write
+        Path tempFile = Files.createTempFile(targetPath.getParent(), "encrypt_", ".tmp");
+
+        try {
+            Cipher cipher = Cipher.getInstance(encProps.getAlgorithm());
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(encProps.getAuthTagBits(), iv);
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, gcmSpec);
+
+            int bufferSize = appProperties.getLimits().getBufferSize();
+
+            try (InputStream is = new BufferedInputStream(Files.newInputStream(sourcePath), bufferSize);
+                 OutputStream os = new BufferedOutputStream(Files.newOutputStream(tempFile), bufferSize)) {
+
+                // Write header if using embedded metadata
+                if (metadataOutput == MetadataOutput.EMBED_HEADER) {
+                    writeHeader(os, iv, keyResult);
+                }
+
+                // Encrypt content
+                try (CipherOutputStream cos = new CipherOutputStream(os, cipher)) {
+                    byte[] buffer = new byte[bufferSize];
+                    int read;
+                    while ((read = is.read(buffer)) != -1) {
+                        cos.write(buffer, 0, read);
+                    }
+                }
+            }
+
+            // Atomic move to target
+            Files.move(tempFile, targetPath, StandardCopyOption.REPLACE_EXISTING, 
+                    StandardCopyOption.ATOMIC_MOVE);
+
+            // Write sidecar metadata if requested
+            if (metadataOutput == MetadataOutput.SIDE_CAR_JSON) {
+                writeSidecarMetadata(targetPath, iv, keyResult);
+            }
+
+            long encryptedSize = Files.size(targetPath);
+
+            // Calculate ciphertext checksum if requested
+            String ciphertextChecksum = null;
+            if (emitChecksums) {
+                ciphertextChecksum = checksumService.calculateChecksumHex(targetPath, "SHA-256");
+            }
+
+            return EncryptData.builder()
+                    .targetPath(targetPath.toString())
+                    .algorithm(encProps.getAlgorithm())
+                    .ivBase64(Base64.getEncoder().encodeToString(iv))
+                    .authTagBits(encProps.getAuthTagBits())
+                    .encryptedSizeBytes(encryptedSize)
+                    .plaintextChecksum(plaintextChecksum)
+                    .ciphertextChecksum(ciphertextChecksum)
+                    .saltBase64(keyResult.saltBase64)
+                    .pbkdf2Iterations(keyResult.iterations)
+                    .metadataOutput(metadataOutput.name())
+                    .build();
+
+        } catch (Exception e) {
+            // Clean up temp file on failure
+            Files.deleteIfExists(tempFile);
+            throw new FileIntelException(ErrorCode.ENCRYPTION_FAILED, 
+                "Encryption failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Decrypts a file encrypted with AES-256-GCM.
+     */
+    public DecryptData decrypt(Path sourcePath, Path targetPath, ActionOptions options,
+            KeyMaterial keyMaterial, boolean dryRun) throws IOException {
+
+        validateKeyMaterial(keyMaterial);
+
+        AppProperties.EncryptionProperties encProps = appProperties.getEncryption();
+        boolean emitChecksums = options != null && options.isEmitChecksums();
+
+        // Read metadata (header or sidecar)
+        EncryptionMetadata metadata = readMetadata(sourcePath);
+
+        // Derive key using salt from metadata if passphrase mode
+        KeyDerivationResult keyResult;
+        if (keyMaterial.getMode() == KeyMode.PASSPHRASE && metadata.saltBase64 != null) {
+            keyResult = deriveKeyWithSalt(keyMaterial, 
+                    Base64.getDecoder().decode(metadata.saltBase64),
+                    metadata.iterations != null ? metadata.iterations : 
+                            appProperties.getPbkdf2().getIterations());
+        } else {
+            keyResult = deriveKey(keyMaterial);
+        }
+
+        if (dryRun) {
+            return DecryptData.builder()
+                    .targetPath(targetPath.toString())
+                    .algorithm(encProps.getAlgorithm())
+                    .authTagVerified(false)
+                    .build();
+        }
+
+        // Create temp file for atomic write
+        Path tempFile = Files.createTempFile(targetPath.getParent(), "decrypt_", ".tmp");
+
+        try {
+            byte[] iv = Base64.getDecoder().decode(metadata.ivBase64);
+            
+            Cipher cipher = Cipher.getInstance(encProps.getAlgorithm());
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(encProps.getAuthTagBits(), iv);
+            cipher.init(Cipher.DECRYPT_MODE, keyResult.key, gcmSpec);
+
+            int bufferSize = appProperties.getLimits().getBufferSize();
+
+            try (InputStream is = new BufferedInputStream(Files.newInputStream(sourcePath), bufferSize);
+                 OutputStream os = new BufferedOutputStream(Files.newOutputStream(tempFile), bufferSize)) {
+
+                // Skip header if present
+                if (metadata.hasEmbeddedHeader) {
+                    skipHeader(is);
+                }
+
+                // Decrypt content
+                try (CipherInputStream cis = new CipherInputStream(is, cipher)) {
+                    byte[] buffer = new byte[bufferSize];
+                    int read;
+                    while ((read = cis.read(buffer)) != -1) {
+                        os.write(buffer, 0, read);
+                    }
+                }
+            }
+
+            // Atomic move to target
+            Files.move(tempFile, targetPath, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+
+            long decryptedSize = Files.size(targetPath);
+
+            // Calculate plaintext checksum if requested
+            String plaintextChecksum = null;
+            if (emitChecksums) {
+                plaintextChecksum = checksumService.calculateChecksumHex(targetPath, "SHA-256");
+            }
+
+            return DecryptData.builder()
+                    .targetPath(targetPath.toString())
+                    .algorithm(encProps.getAlgorithm())
+                    .decryptedSizeBytes(decryptedSize)
+                    .plaintextChecksum(plaintextChecksum)
+                    .authTagVerified(true)
+                    .build();
+
+        } catch (FileIntelException e) {
+            Files.deleteIfExists(tempFile);
+            throw e;
+        } catch (Exception e) {
+            Files.deleteIfExists(tempFile);
+            if (e.getCause() instanceof AEADBadTagException) {
+                throw new FileIntelException(ErrorCode.AUTH_TAG_MISMATCH,
+                    "Authentication tag mismatch - wrong key or corrupted data");
+            }
+            throw new FileIntelException(ErrorCode.DECRYPTION_FAILED,
+                "Decryption failed: " + e.getMessage(), e);
+        }
+    }
+
+    private void validateKeyMaterial(KeyMaterial keyMaterial) {
+        if (keyMaterial == null || keyMaterial.getMode() == null) {
+            throw new FileIntelException(ErrorCode.INVALID_REQUEST, 
+                "Key material is required for crypto operations");
+        }
+        if (keyMaterial.getValue() == null || keyMaterial.getValue().isBlank()) {
+            throw new FileIntelException(ErrorCode.INVALID_REQUEST, 
+                "Key value is required");
+        }
+    }
+
+    private KeyDerivationResult deriveKey(KeyMaterial keyMaterial) {
+        if (keyMaterial.getMode() == KeyMode.RAW_BASE64) {
+            byte[] keyBytes = Base64.getDecoder().decode(keyMaterial.getValue());
+            if (keyBytes.length != 32) {
+                throw new FileIntelException(ErrorCode.INVALID_REQUEST,
+                    "RAW_BASE64 key must be exactly 32 bytes (256 bits)");
+            }
+            SecretKey key = new SecretKeySpec(keyBytes, "AES");
+            return new KeyDerivationResult(key, null, null);
+        } else {
+            // PASSPHRASE mode - generate salt
+            byte[] salt = new byte[appProperties.getPbkdf2().getSaltLength()];
+            secureRandom.nextBytes(salt);
+            int iterations = keyMaterial.getIterations() != null ? 
+                    keyMaterial.getIterations() : appProperties.getPbkdf2().getIterations();
+            return deriveKeyWithSalt(keyMaterial, salt, iterations);
+        }
+    }
+
+    private KeyDerivationResult deriveKeyWithSalt(KeyMaterial keyMaterial, byte[] salt, int iterations) {
+        try {
+            SecretKeyFactory factory = SecretKeyFactory.getInstance(
+                    appProperties.getPbkdf2().getAlgorithm());
+            PBEKeySpec spec = new PBEKeySpec(
+                    keyMaterial.getValue().toCharArray(),
+                    salt,
+                    iterations,
+                    appProperties.getEncryption().getKeySize());
+            SecretKey tmp = factory.generateSecret(spec);
+            SecretKey key = new SecretKeySpec(tmp.getEncoded(), "AES");
+            return new KeyDerivationResult(key, 
+                    Base64.getEncoder().encodeToString(salt), iterations);
+        } catch (Exception e) {
+            throw new FileIntelException(ErrorCode.ENCRYPTION_FAILED,
+                "Key derivation failed: " + e.getMessage(), e);
+        }
+    }
+
+    private void writeHeader(OutputStream os, byte[] iv, KeyDerivationResult keyResult) 
+            throws IOException {
+        DataOutputStream dos = new DataOutputStream(os);
+        dos.writeInt(HEADER_MAGIC);
+        dos.writeShort(HEADER_VERSION);
+        dos.writeShort(iv.length);
+        dos.write(iv);
+        
+        // Write KDF info if applicable
+        if (keyResult.saltBase64 != null) {
+            dos.writeBoolean(true);
+            byte[] salt = Base64.getDecoder().decode(keyResult.saltBase64);
+            dos.writeShort(salt.length);
+            dos.write(salt);
+            dos.writeInt(keyResult.iterations);
+        } else {
+            dos.writeBoolean(false);
+        }
+        dos.flush();
+    }
+
+    private void skipHeader(InputStream is) throws IOException {
+        DataInputStream dis = new DataInputStream(is);
+        int magic = dis.readInt();
+        if (magic != HEADER_MAGIC) {
+            throw new FileIntelException(ErrorCode.DECRYPTION_FAILED,
+                "Invalid encrypted file header");
+        }
+        short version = dis.readShort();
+        short ivLength = dis.readShort();
+        dis.skipBytes(ivLength); // Skip IV (already read from metadata)
+        
+        boolean hasKdf = dis.readBoolean();
+        if (hasKdf) {
+            short saltLength = dis.readShort();
+            dis.skipBytes(saltLength);
+            dis.readInt(); // iterations
+        }
+    }
+
+    private EncryptionMetadata readMetadata(Path sourcePath) throws IOException {
+        // Try sidecar first
+        Path sidecarPath = Path.of(sourcePath.toString() + ".meta.json");
+        if (Files.exists(sidecarPath)) {
+            return objectMapper.readValue(sidecarPath.toFile(), EncryptionMetadata.class);
+        }
+
+        // Read from embedded header
+        try (InputStream is = new BufferedInputStream(Files.newInputStream(sourcePath))) {
+            DataInputStream dis = new DataInputStream(is);
+            int magic = dis.readInt();
+            if (magic != HEADER_MAGIC) {
+                throw new FileIntelException(ErrorCode.DECRYPTION_FAILED,
+                    "Cannot find encryption metadata - no header or sidecar");
+            }
+            
+            short version = dis.readShort();
+            short ivLength = dis.readShort();
+            byte[] iv = new byte[ivLength];
+            dis.readFully(iv);
+            
+            EncryptionMetadata metadata = new EncryptionMetadata();
+            metadata.ivBase64 = Base64.getEncoder().encodeToString(iv);
+            metadata.hasEmbeddedHeader = true;
+            metadata.headerVersion = version;
+            
+            boolean hasKdf = dis.readBoolean();
+            if (hasKdf) {
+                short saltLength = dis.readShort();
+                byte[] salt = new byte[saltLength];
+                dis.readFully(salt);
+                metadata.saltBase64 = Base64.getEncoder().encodeToString(salt);
+                metadata.iterations = dis.readInt();
+            }
+            
+            return metadata;
+        }
+    }
+
+    private void writeSidecarMetadata(Path targetPath, byte[] iv, KeyDerivationResult keyResult) 
+            throws IOException {
+        EncryptionMetadata metadata = new EncryptionMetadata();
+        metadata.ivBase64 = Base64.getEncoder().encodeToString(iv);
+        metadata.saltBase64 = keyResult.saltBase64;
+        metadata.iterations = keyResult.iterations;
+        metadata.algorithm = appProperties.getEncryption().getAlgorithm();
+        metadata.authTagBits = appProperties.getEncryption().getAuthTagBits();
+        
+        Path sidecarPath = Path.of(targetPath.toString() + ".meta.json");
+        objectMapper.writerWithDefaultPrettyPrinter().writeValue(sidecarPath.toFile(), metadata);
+    }
+
+    @Data
+    private static class KeyDerivationResult {
+        private final SecretKey key;
+        private final String saltBase64;
+        private final Integer iterations;
+    }
+
+    @Data
+    public static class EncryptionMetadata {
+        private String ivBase64;
+        private String saltBase64;
+        private Integer iterations;
+        private String algorithm;
+        private Integer authTagBits;
+        private boolean hasEmbeddedHeader;
+        private short headerVersion;
+    }
+}
