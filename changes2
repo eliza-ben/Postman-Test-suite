@@ -1,0 +1,230 @@
+package org.fcb.genesis.fileintel.service;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.SecureRandom;
+import java.util.Base64;
+
+import javax.crypto.AEADBadTagException;
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
+import org.fcb.genesis.fileintel.config.AppProperties;
+import org.fcb.genesis.fileintel.dto.enums.ErrorCode;
+import org.fcb.genesis.fileintel.dto.request.ActionOptions;
+import org.fcb.genesis.fileintel.dto.request.KeyMaterial;
+import org.fcb.genesis.fileintel.dto.response.DecryptData;
+import org.fcb.genesis.fileintel.dto.response.EncryptData;
+import org.fcb.genesis.fileintel.exception.FileIntelException;
+import org.springframework.stereotype.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * CryptoService matching Encrypt_AESGCM / Decrypt_AESGCM format exactly.
+ *
+ * File format: [12 bytes raw IV][AES-256-GCM ciphertext + 16 byte auth tag]
+ * Key:         raw string bytes via getBytes() — no PBKDF2, no base64 wrapping
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class CryptoService {
+
+    private static final int IV_LENGTH     = 12;
+    private static final int GCM_TAG_BITS  = 128;
+    private static final String ALGORITHM  = "AES/GCM/NoPadding";
+    private static final String PROVIDER   = "SunJCE";
+
+    private final AppProperties appProperties;
+    private final ChecksumService checksumService;
+    private final SecureRandom secureRandom = new SecureRandom();
+
+    // -------------------------------------------------------------------------
+    // Encrypt
+    // -------------------------------------------------------------------------
+
+    public EncryptData encrypt(Path sourcePath, Path targetPath, ActionOptions options,
+            KeyMaterial keyMaterial, boolean dryRun) throws IOException {
+
+        byte[] keyBytes = resolveKeyBytes(keyMaterial);
+        boolean emitChecksums = options != null && options.isEmitChecksums();
+
+        String plaintextChecksum = null;
+        if (emitChecksums) {
+            plaintextChecksum = checksumService.calculateChecksumHex(sourcePath, "SHA-256");
+        }
+
+        // Generate IV
+        byte[] iv = new byte[IV_LENGTH];
+        secureRandom.nextBytes(iv);
+
+        if (dryRun) {
+            return EncryptData.builder()
+                    .targetPath(targetPath.toString())
+                    .algorithm(ALGORITHM)
+                    .ivBase64(Base64.getEncoder().encodeToString(iv))
+                    .authTagBits(GCM_TAG_BITS)
+                    .plaintextChecksum(plaintextChecksum)
+                    .build();
+        }
+
+        Path tempFile = Files.createTempFile(targetPath.getParent(), "encrypt_", ".tmp");
+
+        try {
+            SecretKeySpec secretKey = new SecretKeySpec(keyBytes, "AES");
+            Cipher cipher = Cipher.getInstance(ALGORITHM, PROVIDER);
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, new GCMParameterSpec(GCM_TAG_BITS, iv));
+
+            int bufferSize = appProperties.getLimits().getBufferSize();
+
+            try (InputStream is  = new BufferedInputStream(Files.newInputStream(sourcePath), bufferSize);
+                 OutputStream os = new BufferedOutputStream(Files.newOutputStream(tempFile), bufferSize)) {
+
+                // Write raw IV first — exactly as Encrypt_AESGCM does
+                os.write(iv);
+
+                // Encrypt and write ciphertext + auth tag
+                byte[] plaintext = is.readAllBytes();
+                byte[] ciphertext = cipher.doFinal(plaintext);
+                os.write(ciphertext);
+            }
+
+            Files.move(tempFile, targetPath,
+                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+
+            long encryptedSize = Files.size(targetPath);
+
+            String ciphertextChecksum = null;
+            if (emitChecksums) {
+                ciphertextChecksum = checksumService.calculateChecksumHex(targetPath, "SHA-256");
+            }
+
+            return EncryptData.builder()
+                    .targetPath(targetPath.toString())
+                    .algorithm(ALGORITHM)
+                    .ivBase64(Base64.getEncoder().encodeToString(iv))
+                    .authTagBits(GCM_TAG_BITS)
+                    .encryptedSizeBytes(encryptedSize)
+                    .plaintextChecksum(plaintextChecksum)
+                    .ciphertextChecksum(ciphertextChecksum)
+                    .build();
+
+        } catch (Exception e) {
+            Files.deleteIfExists(tempFile);
+            throw new FileIntelException(ErrorCode.ENCRYPTION_FAILED,
+                    "Encryption failed: " + e.getMessage(), e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Decrypt
+    // -------------------------------------------------------------------------
+
+    public DecryptData decrypt(Path sourcePath, Path targetPath, ActionOptions options,
+            KeyMaterial keyMaterial, boolean dryRun) throws IOException {
+
+        byte[] keyBytes = resolveKeyBytes(keyMaterial);
+        boolean emitChecksums = options != null && options.isEmitChecksums();
+
+        if (dryRun) {
+            return DecryptData.builder()
+                    .targetPath(targetPath.toString())
+                    .algorithm(ALGORITHM)
+                    .authTagVerified(false)
+                    .build();
+        }
+
+        Path tempFile = Files.createTempFile(targetPath.getParent(), "decrypt_", ".tmp");
+
+        try (InputStream is = new BufferedInputStream(Files.newInputStream(sourcePath))) {
+
+            // Read the 12-byte IV from the front of the file
+            byte[] iv = new byte[IV_LENGTH];
+            int totalRead = 0;
+            while (totalRead < IV_LENGTH) {
+                int n = is.read(iv, totalRead, IV_LENGTH - totalRead);
+                if (n == -1) {
+                    throw new FileIntelException(ErrorCode.DECRYPTION_FAILED,
+                            "File too short to contain IV");
+                }
+                totalRead += n;
+            }
+
+            log.debug("Decrypting {} — IV: {}", sourcePath.getFileName(),
+                    Base64.getEncoder().encodeToString(iv));
+
+            // Read remaining bytes (ciphertext + GCM tag)
+            byte[] ciphertext = is.readAllBytes();
+
+            // Decrypt — doFinal throws AEADBadTagException on wrong key or corruption
+            SecretKeySpec secretKey = new SecretKeySpec(keyBytes, "AES");
+            Cipher cipher = Cipher.getInstance(ALGORITHM, PROVIDER);
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, new GCMParameterSpec(GCM_TAG_BITS, iv));
+            byte[] plaintext = cipher.doFinal(ciphertext);
+
+            try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(tempFile))) {
+                os.write(plaintext);
+            }
+
+            Files.move(tempFile, targetPath,
+                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+
+            long decryptedSize = Files.size(targetPath);
+
+            String plaintextChecksum = null;
+            if (emitChecksums) {
+                plaintextChecksum = checksumService.calculateChecksumHex(targetPath, "SHA-256");
+            }
+
+            return DecryptData.builder()
+                    .targetPath(targetPath.toString())
+                    .algorithm(ALGORITHM)
+                    .decryptedSizeBytes(decryptedSize)
+                    .plaintextChecksum(plaintextChecksum)
+                    .authTagVerified(true)
+                    .build();
+
+        } catch (FileIntelException e) {
+            Files.deleteIfExists(tempFile);
+            throw e;
+        } catch (Exception e) {
+            Files.deleteIfExists(tempFile);
+            if (e instanceof AEADBadTagException || e.getCause() instanceof AEADBadTagException) {
+                throw new FileIntelException(ErrorCode.AUTH_TAG_MISMATCH,
+                        "Authentication tag mismatch — wrong key or corrupted file");
+            }
+            throw new FileIntelException(ErrorCode.DECRYPTION_FAILED,
+                    "Decryption failed: " + e.getMessage(), e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Key resolution — mirrors: new SecretKeySpec(var0.getBytes(), 0, var0.length(), "AES")
+    // -------------------------------------------------------------------------
+
+    private byte[] resolveKeyBytes(KeyMaterial keyMaterial) {
+        if (keyMaterial == null || keyMaterial.getValue() == null
+                || keyMaterial.getValue().isBlank()) {
+            throw new FileIntelException(ErrorCode.INVALID_REQUEST, "Key value is required");
+        }
+
+        // Raw string bytes — same as Encrypt_AESGCM / Decrypt_AESGCM
+        byte[] keyBytes = keyMaterial.getValue().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        if (keyBytes.length != 16 && keyBytes.length != 24 && keyBytes.length != 32) {
+            throw new FileIntelException(ErrorCode.INVALID_REQUEST,
+                    "Key must be exactly 16, 24, or 32 characters (got " + keyBytes.length + ")");
+        }
+
+        return keyBytes;
+    }
+}
