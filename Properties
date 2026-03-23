@@ -1,4 +1,71 @@
+# ----------------------------------------
+# LOCAL KAFKA CONFIGURATION
+# ----------------------------------------
+spring:
+  kafka:
+    bootstrap-servers: 10.5.16.102:9092
+    properties:
+      security.protocol: SASL_PLAINTEXT
+      sasl:
+        mechanism: PLAIN
+        jaas.config: 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin-secret";'
+      ssl:
+        truststore:
+          location: ./client.truststore.jks
+          password: changeit
+          type: JKS
+      max-poll-records: 1
+      max-poll-interval.ms: 3600000
+    consumer:
+      group-id: TMSPriordayLoadConsumerGroupId
+      key-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring:
+          deserializer:
+            key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+            value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+          json:
+            trusted.packages: "*"
+            use.type.headers: true
+  json:
+    trusted.packages: "*"
 
+kafka:
+  sasl:
+    jaas:
+      config:
+        username: admin
+        password: admin-secret
+
+# ----------------------------------------
+# KAFKA (commented out - production config)
+# ----------------------------------------
+#spring:
+#  kafka:
+#    bootstrap-servers: >-
+#      dfw-vd-sdp01.dev.svbank.com:9094,
+#      dfw-vd-sdp02.dev.svbank.com:9094,
+#      dfw-vd-sdp03.dev.svbank.com:9094,
+#      dfw-vd-sdp04.dev.svbank.com:9094,
+#      dfw-vd-sdp05.dev.svbank.com:9094
+#    properties:
+#      security.protocol: SASL_SSL
+#      sasl:
+#        mechanism: SCRAM-SHA-512
+#    consumer:
+#      properties:
+#        spring:
+#          deserializer:
+#            key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+#            value.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+#kafka:
+#  sasl:
+#    jaas:
+#      config:
+#        username: svc.kafka_tury
+#        vaultId: dev.svbank.com
+#        password: "UnPX/q44>(%sp$>hfJhZv68)$w5Fsn"
 # ----------------------------------------
 # LOCAL KAFKA CONFIGURATION
 # ----------------------------------------
